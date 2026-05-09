@@ -45,6 +45,10 @@
 #include "cpp_main.h"
 #include "ringbuffer.h"
 
+#if DEBUG_TYPE == DEBUG_TYPE_RTT
+  #include "SEGGER_RTT.h"
+#endif
+
 static void WATCHDOG_vInit(void);
 static void WATCHDOG_Refresh(void);
 void TIM4_Init(void);
@@ -110,6 +114,10 @@ int main(void)
 #if BOARD_HAS_MASTER_USART
   // Init debug USART
   MASTER_USART_Init();
+#endif
+
+#if DEBUG_TYPE == DEBUG_TYPE_RTT
+  SEGGER_RTT_ConfigUpBuffer(0, NULL, NULL, 0, SEGGER_RTT_MODE_NO_BLOCK_SKIP);
 #endif
 
   DB_TRACE("\r\n");
@@ -899,6 +907,8 @@ void vprint(const char *fmt, va_list argp)
 #else
 #error "This board does not suport debugging via UART"
 #endif
+#elif DEBUG_TYPE == DEBUG_TYPE_RTT
+    SEGGER_RTT_WriteString(0, (const char *)string);
 #endif
   }
 }
