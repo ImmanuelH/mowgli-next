@@ -17,10 +17,13 @@
 
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "geometry_msgs/msg/point32.hpp"
@@ -82,6 +85,24 @@ struct BTContext
   /// requested area is complete, the BT exits MowingSequence and docks
   /// rather than rolling over to other areas.
   std::optional<int> target_area_index;
+
+  /// Areas already dispatched to PlanCoverageArea+FollowStrip in the
+  /// current session. GetNextUnmowedArea skips any index in this set
+  /// when iterating. An area is added here only after it is genuinely
+  /// exhausted — either because all swaths were mowed, or because the
+  /// per-area attempt counter (area_attempt_count) hit kMaxAreaAttempts.
+  /// Cleared by EndSession.
+  std::set<uint32_t> attempted_areas;
+
+  /// Per-area count of times GetNextUnmowedArea has dispatched the
+  /// area in the current session. Incremented on every dispatch (not
+  /// once per session — replans triggered by boundary recovery or
+  /// FollowStrip retry exhaustion all count). When the counter for an
+  /// area reaches kMaxAreaAttempts, GetNextUnmowedArea promotes it
+  /// into attempted_areas and skips it for the remainder of the
+  /// session. Cleared by EndSession.
+  std::map<uint32_t, uint32_t> area_attempt_count;
+  static constexpr uint32_t kMaxAreaAttempts = 5;
 
   // -----------------------------------------------------------------------
   // Derived / convenience fields (computed from latest_* messages)
@@ -148,6 +169,47 @@ struct BTContext
   double undock_start_y{0.0};
   bool undock_start_recorded{false};
 
+  /// GPS samples (map-frame x, y) accumulated by the GPS subscriber while
+  /// undock_start_recorded is true. CalibrateHeadingFromUndock fits a line
+  /// through these to derive yaw with ~3× the precision of just using the
+  /// start/end endpoints, then persists the result into mowgli_robot.yaml
+  /// via an angular EMA on dock_pose_yaw.
+  ///
+  /// The subscriber dedups by minimum spacing (0.05 m) so a stationary
+  /// chassis doesn't bloat the buffer. Capacity is capped — entries past
+  /// the cap drop the oldest sample.
+  std::vector<std::pair<double, double>> undock_gps_samples;
+  static constexpr size_t kUndockGpsSamplesCap = 200;
+
+  // -----------------------------------------------------------------------
+  // Obstacle-stuck recovery (collision_monitor wedging)
+  // -----------------------------------------------------------------------
+
+  /// Latest action_type from /collision_monitor_state
+  /// (nav2_msgs/CollisionMonitorState). 0 = DO_NOTHING, 1 = STOP,
+  /// 2 = SLOWDOWN, 3 = APPROACH, 4 = LIMIT.
+  uint8_t collision_action_type{0};
+
+  /// Time at which collision_monitor first transitioned into STOP and
+  /// has remained in STOP continuously since. Default-constructed value
+  /// flags "not currently in STOP".
+  std::chrono::steady_clock::time_point collision_stop_since{};
+
+  /// Time of the most recent STOP→non-STOP transition. Default-constructed
+  /// = no STOP has ever ended this session. Used by WasRecentlyInCollisionStop
+  /// so transient obstacles that clear between FollowStrip retry attempts
+  /// don't fall through to MarkBlockedAndSkip and get permanently DEAD-marked.
+  std::chrono::steady_clock::time_point last_collision_stop_end{};
+
+  /// Number of obstacle-backoff recoveries already attempted in the
+  /// current session. Reset by EndSession.
+  int obstacle_backoff_count{0};
+
+  /// Time of the most recent obstacle-backoff success-tick. Used to
+  /// enforce a cooldown so we don't re-fire on the same wedge while
+  /// the BackUp + costmap clear is still settling.
+  std::chrono::steady_clock::time_point last_obstacle_backoff_time{};
+
   // -----------------------------------------------------------------------
   // Per-session flags reset by ClearCommand at session end
   // -----------------------------------------------------------------------
@@ -194,11 +256,33 @@ struct BTContext
   // Cell-based strip coverage state
   // -----------------------------------------------------------------------
 
-  /// Current strip path to mow (set by GetNextStrip, consumed by FollowStrip).
+  /// Current strip / segment path to mow. Populated by GetNextStrip
+  /// (legacy) or GetNextSegment (Path C cell-based coverage), consumed
+  /// by FollowStrip and MarkSegmentBlocked.
   nav_msgs::msg::Path current_strip_path;
 
-  /// Transit goal to reach strip start (set by GetNextStrip, consumed by TransitToStrip).
+  /// Transit goal to reach strip / segment start (populated by
+  /// GetNextStrip or GetNextSegment, consumed by TransitToStrip).
   geometry_msgs::msg::PoseStamped current_transit_goal;
+
+  /// Path C: true when the current segment requires transit
+  /// (>~0.5 m gap or large turn) so the BT must disengage the blade
+  /// before the move and re-engage at the start of the next FollowStrip.
+  /// false → blade stays on for a continuous mowing flow between
+  /// adjacent segments. Updated by GetNextSegment; read by the
+  /// IsShortSegment condition node in the BT XML.
+  bool current_segment_is_long_transit{false};
+
+  /// Path C: free-form tag set by GetNextSegment for diagnostics
+  /// ("interior" / "transit" / "complete").
+  std::string current_segment_phase{};
+
+  /// Path C: termination reason returned by the segment selector for
+  /// the current segment ("boundary" / "obstacle" / "dead_zone" /
+  /// "max_length" / "row_end"). Used by MarkSegmentBlocked decisions —
+  /// e.g. don't bump fail_count when the segment ended at a known
+  /// "obstacle" because that's not a robot failure.
+  std::string current_segment_termination_reason{};
 
   /// Latest coverage percentage.
   float coverage_percent{0.0f};

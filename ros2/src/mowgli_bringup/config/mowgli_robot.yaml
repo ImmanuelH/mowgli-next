@@ -98,13 +98,15 @@ mowgli:
     # -----------------------------------------------------------------
     # Localization backend
     # -----------------------------------------------------------------
-    # use_fusion_graph (default false): replace ekf_map_node with the
-    # GTSAM factor-graph localizer (fusion_graph package). ekf_odom
-    # keeps publishing odom→base_footprint either way. Flip to true on
-    # robots equipped with LiDAR + RTK GPS where you want
-    # scan-matching-driven map-frame consistency through RTK-Float
-    # gaps.
-    use_fusion_graph: false
+    # Map-frame localization is provided by fusion_graph_node (GTSAM
+    # iSAM2 factor graph). It runs WITHOUT LiDAR when
+    # use_scan_matching=false AND use_loop_closure=false — the graph
+    # is just a Pose2 backbone with wheel between-factors, gyro
+    # between-factors (or preintegrated factors when use_imu_preint=
+    # true), and GNSS lever-arm + COG / mag unaries. Equivalent
+    # functionality to the legacy ekf_map_node, with the option to
+    # enable scan-matching + loop closure on LiDAR-equipped robots.
+    use_fusion_graph: true
 
     # use_magnetometer (default false): subscribe to /imu/mag_yaw and
     # let it influence the map-frame yaw. The chassis motor field
@@ -113,22 +115,26 @@ mowgli:
     # mag setup.
     use_magnetometer: false
 
-    # use_scan_matching (default false; only effective when
-    # use_fusion_graph is true): per-tick ICP between the latest /scan
-    # and the previous graph-node scan. Adds a BetweenFactor with
-    # rmse-scaled covariance — bounded drift between consecutive
-    # nodes even without GPS. Required for "robot keeps mowing
-    # through GPS dropouts" scenarios.
-    use_scan_matching: false
+    # use_scan_matching: per-tick ICP between the latest /scan and the
+    # previous graph-node scan. Adds a BetweenFactor with rmse-scaled
+    # covariance — bounded drift between consecutive nodes even when
+    # GPS drops to RTK-Float. Required for "robot keeps mowing through
+    # multi-minute GPS dropouts" scenarios. No-op when the LiDAR
+    # driver is off (use_lidar=false): no /scan publisher, no
+    # subscription, no factors.
+    use_scan_matching: true
 
-    # use_loop_closure (default false; only effective when
-    # use_scan_matching is also true): on every new node, search
-    # earlier graph nodes within ~5 m / >30 s ago for an ICP match
-    # against the current scan. Accepted matches add a BetweenFactor
-    # that snaps the trajectory back to consistency with previously-
-    # seen places. Resets accumulated drift across multi-minute GPS-
-    # less stretches at the cost of one ICP per candidate per tick.
-    use_loop_closure: false
+    # use_loop_closure: on every new node, search earlier graph nodes
+    # within ~5 m / >30 s ago for an ICP match against the current
+    # scan. Accepted matches add a BetweenFactor that snaps the
+    # trajectory back to consistency with previously-seen places.
+    # Resets accumulated drift across multi-minute GPS-less stretches
+    # and at session start when re-entering a previously-mapped area.
+    # Cost: one ICP per candidate per tick (~5 ms each, capped to
+    # lc_max_candidates=3). No-op when use_scan_matching is also
+    # false or when use_lidar=false (the launch file force-OFFs it
+    # on first boot too — see navigation.launch.py).
+    use_loop_closure: true
 
     # -----------------------------------------------------------------
     # GPS / Positioning
@@ -169,6 +175,17 @@ mowgli:
     mow_angle_offset_deg: -1.0    # -1 = auto-detect optimal angle
     mow_angle_increment_deg: 0.0  # rotate pattern each full pass
     headland_width: 0.18           # headland = 1 × tool_width
+    # num_headland_passes: 0 = auto (= ceil(headland_width / tool_width)).
+    # >0 forces exactly that many concentric perimeter rings, e.g. 1 for a
+    # single perimeter pass, 2 for double, regardless of headland_width.
+    num_headland_passes: 0
+    # chassis_safety_inset: planning-time pull-back of the polygon edge
+    # before F2C generates swaths/headlands. Commented out so the
+    # navigation launch defaults it to chassis_width / 2 (= 0.20 m here),
+    # which keeps the chassis edge inside the operator polygon even under
+    # perfect FTC tracking. Override with an explicit metres value here
+    # to bias more (hard fences) or less (open lawn).
+    # chassis_safety_inset: 0.20
     path_spacing: 0.18             # = tool_width for full coverage
     min_turning_radius: 0.30       # differential drive can turn tight
 
@@ -179,10 +196,23 @@ mowgli:
     dock_pose_y: 0.0
     dock_pose_yaw: 4.17            # measured with phone compass (239°)
     undock_distance: 1.5           # reverse distance when undocking (m)
-    undock_speed: 0.15             # reverse speed (m/s)
+    undock_speed: 0.16             # reverse speed (m/s) — above kMinLinVel=0.15 host clamp
     dock_approach_distance: 1.0    # distance to staging pose in front of dock
+    # Overshoot (m) applied to dock_pose in the body forward direction
+    # when configuring opennav_docking's home_dock target. The robot
+    # then aims at (dock_pose + overshoot) instead of dock_pose itself;
+    # combined with docking_threshold (5 cm before the target), it
+    # physically pushes past the calibrated pose so the charging
+    # contacts seat firmly even when fusion's pose has 1-3 cm of
+    # residual RTK / lever-arm noise. 5 cm matches docking_threshold
+    # so a perfect-fusion robot stops exactly at the calibrated pose.
+    dock_approach_overshoot: 0.05
     dock_max_retries: 3
     dock_use_charger_detection: true
+    # Charging-current threshold (A) at which SimpleChargingDock considers
+    # the cradle reached. 0.3 = solid contact past the spring detent on
+    # the YardForce charger; lower stops short, higher over-presses.
+    dock_charging_threshold: 0.3
 
     # -----------------------------------------------------------------
     # Rain
@@ -203,7 +233,11 @@ mowgli:
     # -----------------------------------------------------------------
     # Navigation tolerances (garden terrain)
     # -----------------------------------------------------------------
-    xy_goal_tolerance: 0.75        # metres — acceptable goal position error
-    yaw_goal_tolerance: 1.0        # radians — acceptable heading error
-    coverage_xy_tolerance: 0.5     # metres — for coverage waypoints
+    # 0.30 m / 0.10 rad (was 0.75 / 1.0). The previous values let FTC
+    # report SUCCESS with the chassis 25-40° off the goal yaw, which
+    # made opennav_docking attack the cradle "en biais" (sideways). 0.10
+    # rad (≈5.7°) forces a final in-place pivot before the dock approach.
+    xy_goal_tolerance: 0.30        # metres — acceptable goal position error
+    yaw_goal_tolerance: 0.10       # radians — acceptable heading error
+    coverage_xy_tolerance: 0.10    # metres — for coverage waypoints
     progress_timeout_sec: 60.0     # seconds without progress before recovery

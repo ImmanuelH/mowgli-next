@@ -41,8 +41,9 @@ func NewAPI(dbProvider types.IDBProvider, dockerProvider types.IDockerProvider, 
 	SetupRoutes(apiGroup, firmwareProvider)
 	SystemRoutes(apiGroup)
 	DiagnosticsRoutes(apiGroup, dockerProvider, rosProvider, dbProvider)
-	CalibrationRoutes(apiGroup, rosProvider)
+	CalibrationRoutes(apiGroup, rosProvider, dbProvider)
 	ScheduleRoutes(apiGroup, dbProvider)
+	ImportRoutes(apiGroup, rosProvider, dbProvider)
 	tileServer, err := dbProvider.Get("system.map.enabled")
 	if err != nil {
 		log.Fatal(err)

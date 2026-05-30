@@ -12,6 +12,7 @@ import {
     Space,
     Statistic,
     Table,
+    Tabs,
     Tag,
     Typography,
 } from "antd";
@@ -31,23 +32,33 @@ import {useEmergency} from "../hooks/useEmergency.ts";
 import {usePower} from "../hooks/usePower.ts";
 import {useStatus} from "../hooks/useStatus.ts";
 import {useGPS} from "../hooks/useGPS.ts";
+import {useGnssStatus} from "../hooks/useGnssStatus.ts";
 import {useFusionOdom} from "../hooks/useFusionOdom.ts";
 import {useBTLog} from "../hooks/useBTLog.ts";
 import {useImu} from "../hooks/useImu.ts";
 import {useCogHeading} from "../hooks/useCogHeading.ts";
 import {useMagYaw} from "../hooks/useMagYaw.ts";
 import {useCalibrationStatus} from "../hooks/useCalibrationStatus.ts";
-import {useWheelTicks} from "../hooks/useWheelTicks.ts";
+import {useWheelOdom} from "../hooks/useWheelOdom.ts";
 import {useDiagnosticsSnapshot} from "../hooks/useDiagnosticsSnapshot.ts";
 import {useDiagnostics} from "../hooks/useDiagnostics.ts";
 import {useThemeMode} from "../theme/ThemeContext.tsx";
 import {useIsMobile} from "../hooks/useIsMobile";
-import {AbsolutePoseConstants} from "../types/ros.ts";
+import {
+    deriveGpsStatus,
+    gnssReceiverLabel,
+    hasGnssCapability,
+    readGnssBooleanState,
+    readGnssNumber,
+} from "../utils/gpsStatus.ts";
 import {useEffect, useMemo, useState} from "react";
 import {useSettings} from "../hooks/useSettings.ts";
 import {computeBatteryPercent} from "../utils/battery.ts";
 import {useApi} from "../hooks/useApi.ts";
 import {useFusionGraphDiagnostics} from "../hooks/useFusionGraphDiagnostics.ts";
+import {useMowerAction} from "../components/MowerActions.tsx";
+import {GnssStatusConstants} from "../types/ros.ts";
+import {AlertOutlined} from "@ant-design/icons";
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -98,12 +109,13 @@ export const DiagnosticsPage = () => {
     const power = usePower();
     const status = useStatus();
     const gps = useGPS();
+    const gnssStatus = useGnssStatus();
     const pose = useFusionOdom();
     const btNodeStates = useBTLog();
     const imu = useImu();
     const {imu: cogImu, lastMessageAt: cogLastAt} = useCogHeading();
     const {imu: magImu, lastMessageAt: magLastAt} = useMagYaw();
-    const wheelTicks = useWheelTicks();
+    const wheelOdom = useWheelOdom();
     const {status: calibrationStatus, refresh: refreshCalibration} = useCalibrationStatus();
 
     // Tick state once a second so the "Live/Stale" tags update even when no
@@ -124,13 +136,9 @@ export const DiagnosticsPage = () => {
         [highLevelStatus.battery_percent, power.v_battery, settings],
     );
 
-    const gpsFlags = gps.flags ?? 0;
-    const gpsFixType = useMemo(() => {
-        if (gpsFlags & AbsolutePoseConstants.FLAG_GPS_RTK_FIXED) return "RTK FIX";
-        if (gpsFlags & AbsolutePoseConstants.FLAG_GPS_RTK_FLOAT) return "RTK FLOAT";
-        if (gpsFlags & AbsolutePoseConstants.FLAG_GPS_RTK) return "GPS FIX";
-        return "No Fix";
-    }, [gpsFlags]);
+    const gpsFix = useMemo(() => deriveGpsStatus(gnssStatus), [gnssStatus]);
+    const gpsFixType = gpsFix.label;
+    const gpsReceiver = gnssReceiverLabel(gnssStatus);
 
     const orientation = pose.pose?.pose?.orientation;
     const qx = orientation?.x ?? 0;
@@ -143,8 +151,14 @@ export const DiagnosticsPage = () => {
     const poseZ = pose.pose?.pose?.position?.z ?? 0;
 
     const allContainersOk = !snapshot?.containers?.length || snapshot.containers.every(c => c.state === "running");
-    const gpsOk = gpsFlags > 0 && (gps.position_accuracy ?? 999) <= 0.1;
-    const gpsWarn = gpsFlags > 0 && (gps.position_accuracy ?? 999) > 0.1;
+    const gpsAccuracy = readGnssNumber(
+        gnssStatus,
+        GnssStatusConstants.CAP_HORIZONTAL_ACCURACY,
+        gnssStatus.horizontal_accuracy_m,
+    );
+    const gpsFixValid = gnssStatus.fix_valid ?? false;
+    const gpsOk = gpsFixValid && gpsAccuracy !== undefined && gpsAccuracy <= 0.1;
+    const gpsWarn = gpsFixValid && (gpsAccuracy === undefined || gpsAccuracy > 0.1);
     const cpuTemp = snapshot?.system?.cpu_temperature ?? 0;
 
     const alerts = useMemo(
@@ -155,22 +169,6 @@ export const DiagnosticsPage = () => {
         ),
         [diagnostics.status]
     );
-
-    // Pull the 3 entries published by sensors/gps/gps_health_aggregator.py
-    // and expose key/value lookups so the GPS card can render rich detail
-    // (sat count, mean CN0, RTCM rate, etc.) instead of just the fix tag.
-    const gpsHealth = useMemo(() => {
-        const byName: Record<string, Record<string, string>> = {};
-        for (const s of diagnostics.status ?? []) {
-            if (!s.name?.startsWith("GPS: ")) continue;
-            const kv: Record<string, string> = {};
-            for (const v of s.values ?? []) {
-                kv[v.key] = v.value;
-            }
-            byName[s.name] = { ...kv, _level: String(s.level), _message: s.message ?? "" };
-        }
-        return byName;
-    }, [diagnostics.status]);
 
     // ── Health Summary Bar ───────────────────────────────────────────────────
 
@@ -289,11 +287,105 @@ export const DiagnosticsPage = () => {
 
     const zDriftColor = poseZ > 2 ? colors.danger : poseZ > 0.5 ? colors.warning : undefined;
     const flatCheck = Math.abs(roll) < 5 && Math.abs(pitch) < 5;
-    const gpsFixColor = gpsFixType === "RTK FIX"
+    const gpsFixColor = gpsFix.fixType === "RTK_FIX"
         ? colors.primary
-        : gpsFixType === "RTK FLOAT"
+        : gpsFix.fixType === "RTK_FLOAT"
             ? colors.warning
             : colors.danger;
+    const gpsHdop = readGnssNumber(gnssStatus, GnssStatusConstants.CAP_HDOP, gnssStatus.hdop);
+    const gpsVdop = readGnssNumber(gnssStatus, GnssStatusConstants.CAP_VDOP, gnssStatus.vdop);
+    const gpsVerticalAccuracy = readGnssNumber(
+        gnssStatus,
+        GnssStatusConstants.CAP_VERTICAL_ACCURACY,
+        gnssStatus.vertical_accuracy_m,
+    );
+    const gpsHeading = readGnssNumber(gnssStatus, GnssStatusConstants.CAP_HEADING, gnssStatus.heading_deg);
+    const gpsHeadingAccuracy = readGnssNumber(
+        gnssStatus,
+        GnssStatusConstants.CAP_HEADING_ACCURACY,
+        gnssStatus.heading_accuracy_deg,
+    );
+    const gpsSatellitesUsed = readGnssNumber(
+        gnssStatus,
+        GnssStatusConstants.CAP_SATELLITES_USED,
+        gnssStatus.satellites_used,
+    );
+    const gpsSatellitesVisible = readGnssNumber(
+        gnssStatus,
+        GnssStatusConstants.CAP_SATELLITES_VISIBLE,
+        gnssStatus.satellites_visible,
+    );
+    const gpsSatellitesTracked = readGnssNumber(
+        gnssStatus,
+        GnssStatusConstants.CAP_SATELLITES_TRACKED,
+        gnssStatus.satellites_tracked,
+    );
+    const gpsCorrectionAge = readGnssNumber(
+        gnssStatus,
+        GnssStatusConstants.CAP_CORRECTION_AGE,
+        gnssStatus.correction_age_s,
+    );
+    const gpsMeanCn0 = readGnssNumber(
+        gnssStatus,
+        GnssStatusConstants.CAP_MEAN_CN0,
+        gnssStatus.mean_cn0_db_hz,
+    );
+    const gpsMaxCn0 = readGnssNumber(
+        gnssStatus,
+        GnssStatusConstants.CAP_MAX_CN0,
+        gnssStatus.max_cn0_db_hz,
+    );
+    const differentialState = readGnssBooleanState(
+        gnssStatus,
+        GnssStatusConstants.CAP_DIFFERENTIAL_CORRECTIONS,
+        gnssStatus.differential_corrections,
+    );
+    const correctionsState = readGnssBooleanState(
+        gnssStatus,
+        GnssStatusConstants.CAP_CORRECTIONS_ACTIVE,
+        gnssStatus.corrections_active,
+    );
+    const dualAntennaState = readGnssBooleanState(
+        gnssStatus,
+        GnssStatusConstants.CAP_DUAL_ANTENNA_STATUS,
+        gnssStatus.dual_antenna_heading,
+    );
+    const interferenceState = readGnssBooleanState(
+        gnssStatus,
+        GnssStatusConstants.CAP_INTERFERENCE_STATUS,
+        gnssStatus.interference_detected,
+    );
+    const jammingState = readGnssBooleanState(
+        gnssStatus,
+        GnssStatusConstants.CAP_JAMMING_STATUS,
+        gnssStatus.jamming_detected,
+    );
+    const formatOptionalBool = (value: ReturnType<typeof readGnssBooleanState>) => {
+        switch (value) {
+            case "true":
+                return "Yes";
+            case "false":
+                return "No";
+            case "unknown":
+                return "Unknown";
+            case "unsupported":
+            default:
+                return "Not available";
+        }
+    };
+    const typedGpsDetails = [
+        {flag: GnssStatusConstants.CAP_SATELLITES_USED, label: "Satellites used", value: gpsSatellitesUsed},
+        {flag: GnssStatusConstants.CAP_SATELLITES_VISIBLE, label: "Satellites visible", value: gpsSatellitesVisible},
+        {flag: GnssStatusConstants.CAP_SATELLITES_TRACKED, label: "Satellites tracked", value: gpsSatellitesTracked},
+        {flag: GnssStatusConstants.CAP_HDOP, label: "HDOP", value: gpsHdop, precision: 2},
+        {flag: GnssStatusConstants.CAP_VDOP, label: "VDOP", value: gpsVdop, precision: 2},
+        {flag: GnssStatusConstants.CAP_VERTICAL_ACCURACY, label: "Vertical accuracy (m)", value: gpsVerticalAccuracy, precision: 3},
+        {flag: GnssStatusConstants.CAP_HEADING, label: "Heading (deg)", value: gpsHeading, precision: 1},
+        {flag: GnssStatusConstants.CAP_HEADING_ACCURACY, label: "Heading accuracy (deg)", value: gpsHeadingAccuracy, precision: 2},
+        {flag: GnssStatusConstants.CAP_CORRECTION_AGE, label: "Correction age (s)", value: gpsCorrectionAge, precision: 1},
+        {flag: GnssStatusConstants.CAP_MEAN_CN0, label: "Mean CN0 (dB-Hz)", value: gpsMeanCn0, precision: 1},
+        {flag: GnssStatusConstants.CAP_MAX_CN0, label: "Max CN0 (dB-Hz)", value: gpsMaxCn0, precision: 1},
+    ];
 
     const sectionLocalization = (
         <Row gutter={[12, 12]}>
@@ -409,133 +501,55 @@ export const DiagnosticsPage = () => {
                         <Col span={12}>
                             <Statistic
                                 title="Accuracy (m)"
-                                value={gps.position_accuracy}
+                                value={gpsAccuracy}
                                 precision={3}
                                 valueStyle={
-                                    (gps.position_accuracy ?? 0) > 0.1
+                                    (gpsAccuracy ?? 0) > 0.1
                                         ? {color: colors.warning}
                                         : undefined
                                 }
 
                             />
                         </Col>
-
-                        {/*
-                          * Detail rows backed by sensors/gps/gps_health_aggregator.py.
-                          * The aggregator pulls UBX-NAV-SAT / NAV-COV / RXM-RTCM and
-                          * republishes structured key/values on /diagnostics, so we
-                          * can show satellite counts, signal quality, and RTCM
-                          * health without learning the raw UBX schemas in the GUI.
-                          */}
-                        {(() => {
-                            const sat = gpsHealth["GPS: satellites"];
-                            const rtcm = gpsHealth["GPS: NTRIP/RTCM"];
-                            const fix = gpsHealth["GPS: fix"];
-                            if (!sat && !rtcm && !fix) {
-                                return (
-                                    <Col span={24}>
-                                        <Typography.Text type="secondary" style={{fontSize: 11}}>
-                                            Waiting for /diagnostics from gps_health_aggregator…
-                                        </Typography.Text>
-                                    </Col>
-                                );
-                            }
-                            const cnoMean = sat?.mean_cno_db_hz ? parseFloat(sat.mean_cno_db_hz) : null;
-                            const cnoOk = cnoMean !== null && cnoMean >= 40;
-                            const cnoWarn = cnoMean !== null && cnoMean >= 35 && cnoMean < 40;
-                            const ageS = rtcm?.age_of_last_corr_s ? parseFloat(rtcm.age_of_last_corr_s) : null;
-                            const sigmaMm = fix?.sigma_xy_mm && fix.sigma_xy_mm !== "n/a"
-                                ? parseFloat(fix.sigma_xy_mm) : null;
-                            return (
-                                <>
-                                    <Col span={12}>
-                                        <Statistic
-                                            title="Satellites (used / visible)"
-                                            value={sat ? `${sat.used} / ${sat.visible}` : "—"}
-                                        />
-                                    </Col>
-                                    <Col span={12}>
-                                        <Statistic
-                                            title="Mean CN0 (dB-Hz)"
-                                            value={cnoMean ?? "—"}
-                                            precision={1}
-                                            valueStyle={
-                                                cnoOk ? {color: colors.success}
-                                                : cnoWarn ? {color: colors.warning}
-                                                : cnoMean !== null ? {color: colors.danger}
-                                                : undefined
-                                            }
-                                            suffix={sat?.cno_ge_40_count ? `(${sat.cno_ge_40_count} ≥40)` : undefined}
-                                        />
-                                    </Col>
-                                    {sat?.constellations_used && (
-                                        <Col span={24}>
-                                            <Typography.Text type="secondary" style={{fontSize: 11}}>
-                                                Constellations:{" "}
-                                            </Typography.Text>
-                                            <Typography.Text code style={{fontSize: 11}}>
-                                                {sat.constellations_used}
-                                            </Typography.Text>
-                                        </Col>
-                                    )}
-                                    <Col span={12}>
-                                        <Statistic
-                                            title="RTCM (msg/s)"
-                                            value={rtcm?.msgs_per_sec ?? "—"}
-                                            suffix={rtcm?.msgs_used_pct ? `(${rtcm.msgs_used_pct}% used)` : undefined}
-                                            valueStyle={
-                                                rtcm && parseFloat(rtcm.msgs_per_sec) >= 1 ? {color: colors.success}
-                                                : rtcm ? {color: colors.danger}
-                                                : undefined
-                                            }
-                                        />
-                                    </Col>
-                                    <Col span={12}>
-                                        <Statistic
-                                            title="Last correction (s)"
-                                            value={ageS ?? "—"}
-                                            precision={1}
-                                            valueStyle={
-                                                ageS !== null && ageS > 5 ? {color: colors.danger}
-                                                : ageS !== null && ageS > 2 ? {color: colors.warning}
-                                                : ageS !== null ? {color: colors.success}
-                                                : undefined
-                                            }
-                                        />
-                                    </Col>
-                                    {sigmaMm !== null && (
-                                        <Col span={24}>
-                                            <Typography.Text type="secondary" style={{fontSize: 11}}>
-                                                σ<sub>xy</sub>:{" "}
-                                            </Typography.Text>
-                                            <Typography.Text code style={{fontSize: 11}}>
-                                                {sigmaMm.toFixed(1)} mm
-                                            </Typography.Text>
-                                            {fix?.ttff_s && (
-                                                <>
-                                                    <Typography.Text type="secondary" style={{fontSize: 11, marginLeft: 12}}>
-                                                        TTFF:{" "}
-                                                    </Typography.Text>
-                                                    <Typography.Text code style={{fontSize: 11}}>
-                                                        {fix.ttff_s}s
-                                                    </Typography.Text>
-                                                </>
-                                            )}
-                                        </Col>
-                                    )}
-                                    {rtcm?.types_seen && (
-                                        <Col span={24}>
-                                            <Typography.Text type="secondary" style={{fontSize: 11}}>
-                                                RTCM types:{" "}
-                                            </Typography.Text>
-                                            <Typography.Text code style={{fontSize: 11}}>
-                                                {rtcm.types_seen}
-                                            </Typography.Text>
-                                        </Col>
-                                    )}
-                                </>
-                            );
-                        })()}
+                        <Col span={24}>
+                            <Descriptions size="small" column={2}>
+                                <Descriptions.Item label="Receiver">{gpsReceiver}</Descriptions.Item>
+                                <Descriptions.Item label="Backend">{gnssStatus.backend || "unknown"}</Descriptions.Item>
+                                <Descriptions.Item label="Differential fix">{formatOptionalBool(differentialState)}</Descriptions.Item>
+                                <Descriptions.Item label="Corrections active">{formatOptionalBool(correctionsState)}</Descriptions.Item>
+                                {hasGnssCapability(gnssStatus, GnssStatusConstants.CAP_DUAL_ANTENNA_STATUS) && (
+                                    <Descriptions.Item label="Dual-antenna heading">
+                                        {formatOptionalBool(dualAntennaState)}
+                                    </Descriptions.Item>
+                                )}
+                                {hasGnssCapability(gnssStatus, GnssStatusConstants.CAP_INTERFERENCE_STATUS) && (
+                                    <Descriptions.Item label="RF interference">
+                                        {formatOptionalBool(interferenceState)}
+                                    </Descriptions.Item>
+                                )}
+                                {hasGnssCapability(gnssStatus, GnssStatusConstants.CAP_JAMMING_STATUS) && (
+                                    <Descriptions.Item label="Jamming">
+                                        {formatOptionalBool(jammingState)}
+                                    </Descriptions.Item>
+                                )}
+                                {typedGpsDetails
+                                    .filter((item) => hasGnssCapability(gnssStatus, item.flag))
+                                    .map((item) => (
+                                        <Descriptions.Item key={item.label} label={item.label}>
+                                            {item.value === undefined
+                                                ? "Unknown"
+                                                : item.precision !== undefined
+                                                    ? item.value.toFixed(item.precision)
+                                                    : String(item.value)}
+                                        </Descriptions.Item>
+                                    ))}
+                            </Descriptions>
+                            {!typedGpsDetails.some((item) => hasGnssCapability(gnssStatus, item.flag)) && (
+                                <Typography.Text type="secondary" style={{fontSize: 11}}>
+                                    Advanced GNSS fields are not available for this backend.
+                                </Typography.Text>
+                            )}
+                        </Col>
                     </Row>
                 </Card>
             </Col>
@@ -570,12 +584,13 @@ export const DiagnosticsPage = () => {
     const deltaFilterCog = (!cogStale && cogYawDeg !== null) ? wrap180(yaw - cogYawDeg) : null;
 
     // ── Fusion Graph (iSAM2) panel ───────────────────────────────────────────
-    // Only shown when the operator opted into the GTSAM factor-graph
-    // localizer (use_fusion_graph=true). The panel surfaces the per-tick
-    // GraphStats published on /fusion_graph/diagnostics + Save/Clear actions.
+    // fusion_graph_node is the sole map-frame localizer; the panel
+    // surfaces the per-tick GraphStats it publishes on
+    // /fusion_graph/diagnostics + the Save/Clear service actions.
 
-    const useFusionGraph = String((settings as any)?.use_fusion_graph ?? "false") === "true";
     const guiApi = useApi();
+    const mowerAction = useMowerAction();
+    const resetEmergencyAction = mowerAction("emergency", {Emergency: 0});
     const {stats: fusionStats} = useFusionGraphDiagnostics();
     const [fusionBusy, setFusionBusy] = useState<"save" | "clear" | null>(null);
 
@@ -622,7 +637,7 @@ export const DiagnosticsPage = () => {
     const scanTotal = (scanOk ?? 0) + (scanFail ?? 0);
     const scanRate = scanTotal > 0 ? Math.round(((scanOk ?? 0) / scanTotal) * 100) : null;
 
-    const sectionFusionGraph = useFusionGraph ? (
+    const sectionFusionGraph = (
         <Row gutter={[12, 12]}>
             <Col span={24}>
                 <Card
@@ -714,12 +729,12 @@ export const DiagnosticsPage = () => {
                 </Card>
             </Col>
         </Row>
-    ) : null;
+    );
 
     const sectionHeadingSources = (
         <Row gutter={[12, 12]}>
             <Col span={24}>
-                <Card title={<Space><CompassOutlined/> Heading sources {useFusionGraph ? "(fused by fusion_graph)" : "(fused by ekf_map)"}</Space>} size="small">
+                <Card title={<Space><CompassOutlined/> Heading sources (fused by fusion_graph)</Space>} size="small">
                     <Row gutter={[12, 12]}>
                         <Col xs={24} md={8}>
                             <Space direction="vertical" style={{width: "100%"}}>
@@ -858,9 +873,30 @@ export const DiagnosticsPage = () => {
                                 }}
                             />
                         </Col>
+                        <Col span={8}>
+                            <Statistic
+                                title="Charge current"
+                                value={power.charge_current}
+                                precision={2}
+                                suffix="A"
+                                valueStyle={{
+                                    color: highLevelStatus.is_charging && (power.charge_current ?? 0) > 0
+                                        ? colors.primary
+                                        : undefined,
+                                }}
+                            />
+                        </Col>
+                        <Col span={8}>
+                            <Statistic
+                                title="Charger voltage"
+                                value={power.v_charge}
+                                precision={2}
+                                suffix="V"
+                            />
+                        </Col>
                     </Row>
                     <div style={{marginTop: 12}}>
-                        <Space>
+                        <Space wrap>
                             <Typography.Text type="secondary" style={{fontSize: 12}}>Emergency</Typography.Text>
                             <Tag color={emergency.active_emergency ? "error" : emergency.latched_emergency ? "warning" : "default"}>
                                 {emergency.active_emergency
@@ -869,6 +905,16 @@ export const DiagnosticsPage = () => {
                                         ? "Latched"
                                         : "Clear"}
                             </Tag>
+                            {(emergency.active_emergency || emergency.latched_emergency) && (
+                                <Button
+                                    danger
+                                    size="small"
+                                    icon={<AlertOutlined/>}
+                                    onClick={resetEmergencyAction}
+                                >
+                                    Reset emergency
+                                </Button>
+                            )}
                         </Space>
                     </div>
                     {btNodeStates.size > 0 && (
@@ -1236,28 +1282,28 @@ export const DiagnosticsPage = () => {
                         <Col span={12}>
                             <Statistic
                                 title="Linear Vel (m/s)"
-                                value={(wheelTicks as any).linear_velocity_x}
+                                value={wheelOdom.twist?.twist?.linear?.x}
                                 precision={3}
                             />
                         </Col>
                         <Col span={12}>
                             <Statistic
                                 title="Angular Vel (rad/s)"
-                                value={(wheelTicks as any).angular_velocity_z}
+                                value={wheelOdom.twist?.twist?.angular?.z}
                                 precision={3}
                             />
                         </Col>
                         <Col span={12}>
                             <Statistic
                                 title="Pose X (m)"
-                                value={(wheelTicks as any).pose_x}
+                                value={wheelOdom.pose?.pose?.position?.x}
                                 precision={3}
                             />
                         </Col>
                         <Col span={12}>
                             <Statistic
                                 title="Pose Y (m)"
-                                value={(wheelTicks as any).pose_y}
+                                value={wheelOdom.pose?.pose?.position?.y}
                                 precision={3}
                             />
                         </Col>
@@ -1392,11 +1438,11 @@ export const DiagnosticsPage = () => {
                             label: <Space><CompassOutlined/> Localization</Space>,
                             children: sectionLocalization,
                         },
-                        ...(sectionFusionGraph ? [{
+                        {
                             key: "fusion_graph",
                             label: <Space><CompassOutlined/> Fusion Graph</Space>,
                             children: sectionFusionGraph,
-                        }] : []),
+                        },
                         {
                             key: "heading_sources",
                             label: <Space><CompassOutlined/> Heading sources</Space>,
@@ -1433,20 +1479,51 @@ export const DiagnosticsPage = () => {
         );
     }
 
+    // Desktop: 5 tabs to keep the page from sprawling. Health bar and (when
+    // non-empty) Alerts stay pinned at the top so an oncall operator never
+    // has to dig through tabs to see whether something is on fire.
+    const tabItems = [
+        {
+            key: "system",
+            label: <Space><CloudServerOutlined/> System</Space>,
+            children: <Space direction="vertical" size="middle" style={{width: "100%"}}>
+                {sectionSystem}
+                {sectionRosDiagnostics}
+            </Space>,
+        },
+        {
+            key: "localization",
+            label: <Space><CompassOutlined/> Localization</Space>,
+            children: <Space direction="vertical" size="middle" style={{width: "100%"}}>
+                {sectionLocalization}
+                {sectionFusionGraph}
+                {sectionHeadingSources}
+            </Space>,
+        },
+        {
+            key: "robot",
+            label: <Space><ApiOutlined/> Robot</Space>,
+            children: <Space direction="vertical" size="middle" style={{width: "100%"}}>
+                {sectionBtCoverage}
+                {sectionSensors}
+            </Space>,
+        },
+        {
+            key: "calibration",
+            label: <Space><CompassOutlined/> Calibration</Space>,
+            children: <Space direction="vertical" size="middle" style={{width: "100%"}}>
+                {sectionCrossChecks}
+                {sectionCalibrationStatus}
+            </Space>,
+        },
+    ];
+
     return (
-        <Row gutter={[16, 16]}>
-            <Col span={24}>{healthBar}</Col>
-            {sectionAlerts && <Col span={24}>{sectionAlerts}</Col>}
-            <Col span={24}>{sectionSystem}</Col>
-            <Col span={24}>{sectionLocalization}</Col>
-            {sectionFusionGraph && <Col span={24}>{sectionFusionGraph}</Col>}
-            <Col span={24}>{sectionHeadingSources}</Col>
-            <Col span={24}>{sectionBtCoverage}</Col>
-            <Col span={24}>{sectionCrossChecks}</Col>
-            <Col span={24}>{sectionCalibrationStatus}</Col>
-            <Col span={24}>{sectionSensors}</Col>
-            <Col span={24}>{sectionRosDiagnostics}</Col>
-        </Row>
+        <Space direction="vertical" size="middle" style={{width: "100%"}}>
+            {healthBar}
+            {sectionAlerts}
+            <Tabs defaultActiveKey="system" items={tabItems} size="large"/>
+        </Space>
     );
 };
 

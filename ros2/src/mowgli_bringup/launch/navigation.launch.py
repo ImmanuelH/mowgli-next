@@ -20,23 +20,29 @@ navigation.launch.py
 Navigation stack launch file for the Mowgli robot mower.
 
 Brings up:
-  1. robot_localization dual-EKF — ekf_odom (wheels + gyro → odom→base_footprint
-     TF, continuous) and ekf_map (+ GPS via navsat_transform → map→odom
-     correction). Sub-cm σ_xy under RTK-Fixed.
-  2. Three helper nodes — dock_yaw_to_set_pose (seeds both EKFs with the dock
-     heading on the is_charging rising edge), cog_to_imu (GPS COG as a
-     continuous absolute-yaw observation with adaptive covariance), and
-     mag_yaw_publisher (tilt-compensated LIS3MDL magnetometer yaw, gated on
+  1. Localization — fusion_graph_node (GTSAM iSAM2 factor graph) owns
+     both map→odom AND odom→base_footprint. Map-frame inputs: wheel +
+     IMU + GPS + COG (+ optional LiDAR scan-matching and loop-closure).
+     Local-frame: wheel vx + gyro_z integrated at IMU rate (replaces
+     the standalone robot_localization ekf_odom_node).
+  2. Two helper nodes — cog_to_imu (GPS COG as a continuous absolute-
+     yaw observation with adaptive covariance) and mag_yaw_publisher
+     (tilt-compensated LIS3MDL magnetometer yaw, gated on
      /ros2_ws/maps/mag_calibration.yaml existing).
-  3. Nav2 bringup — full navigation stack (controllers, planners, recoveries,
-     BT navigator, costmaps, lifecycle).
+  3. Nav2 bringup — full navigation stack (controllers, planners,
+     recoveries, BT navigator, costmaps, lifecycle).
 
 Architecture (REP-105):
-  map → (ekf_map) → odom → (ekf_odom) → base_footprint → base_link → sensors
-  ekf_map fuses /gps/pose_cov (from navsat_to_absolute_pose_node, datum +
-  lever-arm corrected) as pose0. The slam_toolbox RTK fallback that
-  previously fed /map_pose has been removed; fusion_graph (planned, see
-  docs/HANDOFF_FUSION_GRAPH.md) will replace ekf_map_node end-to-end.
+  map → odom → base_footprint → base_link → sensors
+  fusion_graph_node owns both map→odom AND odom→base_footprint.
+  It runs WITHOUT LiDAR when use_scan_matching=false AND
+  use_loop_closure=false — the graph is then just a Pose2 backbone
+  with wheel between-factors, gyro between-factors, and GNSS
+  lever-arm + COG / mag unaries; local-frame DR is still produced
+  from the same wheel + gyro stream.
+  ekf_map_node, ekf_odom_node, slam_toolbox, Kinematic-ICP, and
+  FusionCore have all been removed — see CLAUDE.md "What NOT to Do"
+  for deprecated paths.
 """
 
 import os
@@ -75,7 +81,6 @@ def generate_launch_description() -> LaunchDescription:
     # ------------------------------------------------------------------
     _runtime_cfg_path = "/ros2_ws/config/mowgli_robot.yaml"
     _early_use_lidar = "true"
-    _early_use_fusion_graph = "false"
     _early_use_magnetometer = "false"
     _early_use_scan_matching = "false"
     _early_use_loop_closure = "false"
@@ -84,14 +89,12 @@ def generate_launch_description() -> LaunchDescription:
             with open(_runtime_cfg_path, "r") as _f:
                 _cfg = yaml.safe_load(_f) or {}
             _rp = _cfg.get("mowgli", {}).get("ros__parameters", {})
-            # use_lidar accepts either key for back-compat with installs
-            # that wrote the env-style name into mowgli_robot.yaml.
-            if "use_lidar" in _rp:
-                _early_use_lidar = "true" if bool(_rp["use_lidar"]) else "false"
-            elif "lidar_enabled" in _rp:
+            # The yaml key is `lidar_enabled` (matches install
+            # template + GUI). The launch CLI arg is still
+            # `use_lidar:=true|false` so existing CI / dev scripts
+            # don't break.
+            if "lidar_enabled" in _rp:
                 _early_use_lidar = "true" if bool(_rp["lidar_enabled"]) else "false"
-            _early_use_fusion_graph = "true" if bool(
-                _rp.get("use_fusion_graph", False)) else "false"
             _early_use_magnetometer = "true" if bool(
                 _rp.get("use_magnetometer", False)) else "false"
             _early_use_scan_matching = "true" if bool(
@@ -112,31 +115,14 @@ def generate_launch_description() -> LaunchDescription:
         _early_use_lidar = "true"
 
     # ------------------------------------------------------------------
-    # Auto-graduation rule for fusion_graph
+    # Loop-closure gating
     # ------------------------------------------------------------------
-    # When the operator opts in (`use_fusion_graph: true` in
-    # mowgli_robot.yaml), we still don't blindly hand over map→odom
-    # to fusion_graph_node — a polluted/half-built graph could spin
-    # Nav2 in a wrong frame. Instead:
-    #
-    #   - If a persisted graph exists on disk → fusion_graph runs as
-    #     PRIMARY (owns map→odom + /odometry/filtered_map). ekf_map
-    #     is skipped. Loop closure honours the operator yaml flag.
-    #   - If no graph file → fusion_graph runs in OBSERVER mode
-    #     (publishes to /fusion_graph/odometry, no TF). ekf_map keeps
-    #     driving Nav2. Loop closure is force-OFF (nothing meaningful
-    #     to close against in a bootstrapping graph). On dock arrival
-    #     fusion_graph auto-saves; the next boot picks up the file
-    #     and graduates to PRIMARY.
-    #
-    # This way the operator never has to time the use_fusion_graph
-    # flip — the system bootstraps itself.
+    # Loop closure (when use_loop_closure=true) is force-OFF on the
+    # very first boot — there is no persisted graph for the iSAM2
+    # backend to close against. fusion_graph_node auto-saves on dock
+    # arrival, so the next boot honours the operator yaml flag.
     _graph_file = "/ros2_ws/maps/fusion_graph.graph"
     _graph_exists = os.path.isfile(_graph_file)
-    _early_primary_mode = (
-        "true" if _early_use_fusion_graph == "true" and _graph_exists
-        else "false"
-    )
     _effective_use_loop_closure = (
         _early_use_loop_closure if _graph_exists else "false"
     )
@@ -159,13 +145,7 @@ def generate_launch_description() -> LaunchDescription:
     use_lidar_arg = DeclareLaunchArgument(
         "use_lidar",
         default_value=_early_use_lidar,
-        description="When false, use nav2_params_no_lidar.yaml (no obstacle layer, collision monitor pass-through). Default read from mowgli_robot.yaml.use_lidar (or .lidar_enabled); CLI/compose override wins.",
-    )
-
-    use_fusion_graph_arg = DeclareLaunchArgument(
-        "use_fusion_graph",
-        default_value=_early_use_fusion_graph,
-        description="Replace ekf_map_node with fusion_graph_node (GTSAM). Default read from mowgli_robot.yaml.use_fusion_graph; CLI override wins. ekf_odom_node keeps publishing odom->base_footprint either way.",
+        description="When false, use nav2_params_no_lidar.yaml (no obstacle layer, collision monitor pass-through). Default read from mowgli_robot.yaml.lidar_enabled; CLI/compose override wins.",
     )
 
     use_magnetometer_arg = DeclareLaunchArgument(
@@ -186,10 +166,33 @@ def generate_launch_description() -> LaunchDescription:
         description="Loop-closure search against earlier graph nodes (fusion_graph). Default read from mowgli_robot.yaml AND gated on a persisted graph file existing on disk — first session can't loop-close against itself.",
     )
 
-    primary_mode_arg = DeclareLaunchArgument(
-        "primary_mode",
-        default_value=_early_primary_mode,
-        description="Auto-set: true when use_fusion_graph is yes AND a persisted graph exists on disk (fusion_graph drives Nav2). False otherwise (fusion_graph runs in observer mode building a graph for next session, ekf_map_node drives Nav2).",
+    cog_stationary_seed_rate_hz_arg = DeclareLaunchArgument(
+        "cog_stationary_seed_rate_hz",
+        default_value="2.0",
+        description="cog_to_imu stationary anchor rate (Hz). Real hardware: 2.0 (anchors fusion_graph). Sim with kinematic teleport: set to 0.0 — the stale anchor pins ekf_map yaw against gyro integration during PRE_ROTATE (issue #200).",
+    )
+
+    # ------------------------------------------------------------------
+    # TF forward-stamp / fusion_graph cadence — sim vs hardware.
+    # Defaults are the HARDWARE-correct values (no forward extrapolation,
+    # 25 Hz factor-graph). sim_full_system.launch.py overrides these to
+    # the sim-friendly values (0.1 s lead, 50 Hz) where the sim_time
+    # phase offset between publish and lookup forces ExtrapolationException
+    # at lower rates / no lead. On real hardware, forward-stamping the
+    # map TF by 100 ms costs 5° of yaw error per pivot at 0.5 rad/s
+    # — visible on Foxglove and pushed into FTC's heading PID.
+    # fusion_graph_tf_lead_s is shared by map→odom AND odom→base
+    # publishers inside fusion_graph_node now that ekf_odom is gone.
+    # ------------------------------------------------------------------
+    fusion_graph_tf_lead_arg = DeclareLaunchArgument(
+        "fusion_graph_tf_lead_s",
+        default_value="0.0",
+        description="fusion_graph TF forward-stamp (seconds), applied to both map→odom and odom→base_footprint. Hardware default 0.0. Sim should set 0.1.",
+    )
+    fusion_graph_node_period_arg = DeclareLaunchArgument(
+        "fusion_graph_node_period_s",
+        default_value="0.04",
+        description="fusion_graph factor-graph node cadence (seconds). Hardware default 0.04 = 25 Hz (5x faster than 5 Hz controller queries, sustainable on Pi). Sim default 0.02 = 50 Hz to absorb sim_time TF gaps.",
     )
 
     # ------------------------------------------------------------------
@@ -198,11 +201,11 @@ def generate_launch_description() -> LaunchDescription:
     use_sim_time = LaunchConfiguration("use_sim_time")
     use_ekf = LaunchConfiguration("use_ekf")
     use_lidar = LaunchConfiguration("use_lidar")
-    use_fusion_graph = LaunchConfiguration("use_fusion_graph")
     use_magnetometer = LaunchConfiguration("use_magnetometer")
     use_scan_matching = LaunchConfiguration("use_scan_matching")
     use_loop_closure = LaunchConfiguration("use_loop_closure")
-    primary_mode = LaunchConfiguration("primary_mode")
+    fusion_graph_tf_lead_s = LaunchConfiguration("fusion_graph_tf_lead_s")
+    fusion_graph_node_period_s = LaunchConfiguration("fusion_graph_node_period_s")
 
     # ------------------------------------------------------------------
     # Config paths
@@ -257,10 +260,12 @@ def generate_launch_description() -> LaunchDescription:
     # Nav2 YAMLs (controller + docking) alongside the dock pose.
     #   transit_speed    → FollowPath.desired_linear_vel + max_speed_xy
     #   mowing_speed     → FollowCoveragePath.max_speed_xy
-    #   undock_speed     → BackUp backup_speed attribute in main_tree.xml
-    #                      (hardcoded in the XML so not injected here, but
-    #                      the comment keeps the three values together
-    #                      for discoverability).
+    #   undock_speed     → behavior_tree_node param of the same name,
+    #                      pushed onto the BT blackboard at startup and
+    #                      read by undock-flow BackUp instances via
+    #                      backup_speed="{undock_speed}" in main_tree.xml.
+    #                      Wired in full_system.launch.py (Node parameters
+    #                      list). See issue #191.
     transit_speed = 0.3
     mowing_speed = 0.25
     datum_lat = 0.0
@@ -272,8 +277,52 @@ def generate_launch_description() -> LaunchDescription:
     # into the rewritten Nav2 yaml below alongside the speeds.
     xy_goal_tolerance = 0.30
     yaw_goal_tolerance = 0.5
-    coverage_xy_tolerance = 0.5
+    # coverage_xy_tolerance: must equal coverage_goal_checker.xy_goal_tolerance.
+    # 0.10 m to match the StoppedGoalChecker tolerance — completion is
+    # gated by robot velocity (must be ≈ stopped), so the xy tolerance
+    # only needs to be loose enough for FTC's PID to converge.
+    coverage_xy_tolerance = 0.10
+    # Single source of truth for blade cutting width — flowed from
+    # mowgli_robot.yaml.tool_width into both map_server (param
+    # tool_width, used by mark_cells_mowed stamp + sliver detection)
+    # and the coverage_server (param operation_width, which becomes
+    # F2C Robot::setCovWidth, controlling swath spacing). The two
+    # used to be separately configured (mower_width=0.18 + statically
+    # operation_width=0.20), which made map_server's stamp radius
+    # narrower than F2C's swath spacing — every gap between adjacent
+    # swaths had a strip of cells that map_server never marked as
+    # mowed. Sharing the one number fixes that by construction.
+    tool_width = 0.18
+    # F2C v2 coverage tuning. Operator-tunable via the GUI's Mowing
+    # section; injected into coverage_server's parameters at launch
+    # so changes via mowgli_robot.yaml take effect on next bringup.
+    headland_width = 0.35
+    min_turning_radius = 0.05
     progress_timeout_sec = 300.0
+    # num_headland_passes: 0 = auto (ceil(headland_width / tool_width)),
+    # >0 forces exactly that many concentric perimeter rings.
+    num_headland_passes = 0
+    # chassis_safety_inset: how far INSIDE the operator polygon the F2C
+    # planning field is pre-shrunk before any swath/headland computation.
+    # Default = chassis_width / 2 (computed below) so the chassis edge
+    # cannot cross the polygon boundary under perfect FTC tracking;
+    # tracking error then has to overshoot by half the chassis to escape,
+    # which is well outside FTC's <10 mm lateral spec on coverage swaths.
+    # An explicit override in mowgli_robot.yaml wins over the default.
+    chassis_safety_inset = None
+    # Dock approach distance: how far behind the dock the opennav_docking
+    # staging pose sits. Edited as `dock_approach_distance` in the GUI
+    # (positive metres), injected here as the negative-X
+    # `home_dock.staging_x_offset` consumed by docking_server. The yaml
+    # value was orphan before this — editing the slider produced no
+    # operational change because docking_server kept its hardcoded
+    # -1.5 m default. See issue #192.
+    dock_approach_distance = 1.5
+    # SimpleChargingDock charging-current threshold (amps). 0.3 is the
+    # production default (see nav2_params.yaml for the "0.1 stops too
+    # early, 0.5 over-presses" rationale). Operator-overridable via
+    # mowgli_robot.yaml so sites with different chargers can tune.
+    dock_charging_threshold = 0.3
     # Phantom-tuning knobs surfaced through mowgli_robot.yaml so the GUI
     # can edit them without an SSH session. Defaults match the C++ node
     # defaults; override on the Settings page.
@@ -301,6 +350,29 @@ def generate_launch_description() -> LaunchDescription:
             rt_rp.get("yaw_goal_tolerance", yaw_goal_tolerance))
         coverage_xy_tolerance = float(
             rt_rp.get("coverage_xy_tolerance", coverage_xy_tolerance))
+        dock_approach_distance = float(
+            rt_rp.get("dock_approach_distance", dock_approach_distance))
+        dock_approach_overshoot = float(
+            rt_rp.get("dock_approach_overshoot", 0.05))
+        dock_charging_threshold = float(
+            rt_rp.get("dock_charging_threshold", dock_charging_threshold))
+        # Defensive clip: a stale per-site mowgli_robot.yaml can carry
+        # the legacy 0.5 m default that breaks cell-based mowing (the
+        # SimpleGoalChecker fires on tick 1 because the strip end is
+        # within tolerance of the robot's current pose, FTC reports
+        # SUCCEEDED before publishing any cmd_vel, BT loops forever).
+        # Cap at 0.15 m here — comfortably below tool_width (0.18 m)
+        # so a forgotten YAML field can't reproduce the field bug on a
+        # fresh deploy, and below typical strip length so the goal
+        # checker can't latch mid-strip.
+        if coverage_xy_tolerance > 0.15:
+            print(
+                "WARN: coverage_xy_tolerance={} m exceeds the 0.15 m safe ceiling "
+                "(robot may declare success too early on the final approach, or "
+                "latch mid-strip). Clipping to 0.15. Update "
+                "mowgli_robot.yaml.coverage_xy_tolerance to silence.".format(
+                    coverage_xy_tolerance))
+            coverage_xy_tolerance = 0.15
         progress_timeout_sec = float(
             rt_rp.get("progress_timeout_sec", progress_timeout_sec))
         dock_pose_yaw_sigma_rad = float(rt_rp.get(
@@ -310,6 +382,20 @@ def generate_launch_description() -> LaunchDescription:
         declination_deg = float(rt_rp.get("declination_deg", declination_deg))
         min_horizontal_uT = float(rt_rp.get("min_horizontal_uT", min_horizontal_uT))
         mag_yaw_variance = float(rt_rp.get("mag_yaw_variance", mag_yaw_variance))
+        tool_width = float(rt_rp.get("tool_width", tool_width))
+        headland_width = float(rt_rp.get("headland_width", headland_width))
+        min_turning_radius = float(rt_rp.get(
+            "min_turning_radius", min_turning_radius))
+        num_headland_passes = int(rt_rp.get(
+            "num_headland_passes", num_headland_passes))
+        # Operator override wins; otherwise fall back to chassis_width/2
+        # (cw was already read above from the same runtime config).
+        if "chassis_safety_inset" in rt_rp:
+            chassis_safety_inset = float(rt_rp["chassis_safety_inset"])
+    if chassis_safety_inset is None:
+        # cw is the chassis width read from the same runtime config a few
+        # lines above; default the inset to half of it.
+        chassis_safety_inset = cw / 2.0
 
     # Compute BT XML paths from installed package shares (not hardcoded).
     bt_nav_to_pose_xml = os.path.join(
@@ -347,10 +433,41 @@ def generate_launch_description() -> LaunchDescription:
         with open(src_path, "r") as fh:
             doc = yaml.safe_load(fh) or {}
         # home_dock.pose must be a YAML list (PARAMETER_DOUBLE_ARRAY).
-        (doc.setdefault("docking_server", {})
-            .setdefault("ros__parameters", {})
-            .setdefault("home_dock", {}))["pose"] = [
-                dock_pose_x, dock_pose_y, dock_pose_yaw]
+        home_dock = (doc.setdefault("docking_server", {})
+                        .setdefault("ros__parameters", {})
+                        .setdefault("home_dock", {}))
+        # Apply dock_approach_overshoot in the body forward direction.
+        # opennav_docking's graceful_controller will drive toward this
+        # shifted target and stop at docking_threshold (5 cm) before it,
+        # putting the robot physically at the calibrated dock_pose with
+        # firm contact on the charging cradle — instead of stopping
+        # 5 cm short like the un-offset configuration did 2026-05-17.
+        # The overshoot is yaml-tunable (dock_approach_overshoot in
+        # mowgli_robot.yaml); 0 disables the shift cleanly.
+        import math as _math
+        _cos_yaw = _math.cos(dock_pose_yaw)
+        _sin_yaw = _math.sin(dock_pose_yaw)
+        home_dock["pose"] = [
+            dock_pose_x + dock_approach_overshoot * _cos_yaw,
+            dock_pose_y + dock_approach_overshoot * _sin_yaw,
+            dock_pose_yaw,
+        ]
+        # Staging pose offset along the dock's X axis (negative = behind
+        # the dock, the side the robot approaches from). yaml exposes
+        # dock_approach_distance as a positive metres knob in the GUI;
+        # opennav_docking expects the same value negative. Wiring the
+        # two replaces the previously-orphan dock_approach_distance —
+        # the GUI slider now drives the actual staging point. See
+        # issue #192.
+        home_dock["staging_x_offset"] = -float(dock_approach_distance)
+
+        # SimpleChargingDock plugin params — charging-current threshold
+        # is operator-tunable so the static nav2_params.yaml value can be
+        # overridden per-site from mowgli_robot.yaml + GUI.
+        scd = (doc.setdefault("docking_server", {})
+                  .setdefault("ros__parameters", {})
+                  .setdefault("simple_charging_dock", {}))
+        scd["charging_threshold"] = dock_charging_threshold
 
         # FollowPath (transit controller = RPP via RotationShim).
         fp = (doc.setdefault("controller_server", {})
@@ -382,6 +499,23 @@ def generate_launch_description() -> LaunchDescription:
         # achieve required_movement_radius before declaring no-progress.
         pc = cs_params.setdefault("progress_checker", {})
         pc["movement_time_allowance"] = progress_timeout_sec
+
+        # coverage_server (mowgli_coverage / Fields2Cover v2): the F2C
+        # operation_width is the swath spacing (Robot::setCovWidth). Tie
+        # it directly to the blade's effective cutting width — without
+        # the alignment, F2C plans swaths spaced wider than the blade
+        # can cover, leaving thin un-mowed strips between every pair of
+        # adjacent swaths (the previous static 0.20 m vs blade 0.18 m
+        # gave a 2 cm gap × tracking error → the 54 % coverage seen in
+        # 2026-05-12). One value, two consumers (map_server's stamp
+        # radius is also tool_width / 2 — perfectly tiles).
+        cov_params = (doc.setdefault("coverage_server", {})
+                          .setdefault("ros__parameters", {}))
+        cov_params["operation_width"] = tool_width
+        cov_params["default_headland_width"] = headland_width
+        cov_params["min_turning_radius"] = min_turning_radius
+        cov_params["num_headland_passes"] = num_headland_passes
+        cov_params["chassis_safety_inset"] = chassis_safety_inset
 
         tmp = tempfile.NamedTemporaryFile(
             mode="w", prefix="mowgli_nav2_", suffix=".yaml", delete=False)
@@ -475,20 +609,14 @@ def generate_launch_description() -> LaunchDescription:
     )
 
     # ------------------------------------------------------------------
-    # Alternative localization backend: robot_localization
+    # gps_link → gps static alias.
     # ------------------------------------------------------------------
-    # Three nodes. Active only when localization_backend == "robot_localization".
-    # ekf_odom_node         : wheels + IMU gyro → odom → base_footprint TF
-    # navsat_transform_node : /gps/fix + /odometry/filtered → /odometry/gps
-    # ekf_map_node          : wheels + IMU + /odometry/gps → map → odom TF
-    robot_localization_params = os.path.join(
-        bringup_dir, "config", "robot_localization.yaml"
-    )
-
-    # navsat_transform_node looks up a TF from base_footprint to the frame
-    # named in the NavSatFix header. Our URDF calls that frame gps_link,
-    # but the ublox_dgnss driver publishes frame_id=gps. Alias gps_link →
-    # gps as a static identity so the lookup finds a chain.
+    # Historical: navsat_transform_node used to look up a TF from
+    # base_footprint to the NavSatFix header frame. Our URDF calls
+    # that frame gps_link; the ublox_dgnss driver publishes frame_id=gps.
+    # navsat_transform was removed 2026-04-26, but the alias is still
+    # cheap insurance for any third-party tool that walks the frame
+    # tree from gps.
     static_gps_link_alias = Node(
         package="tf2_ros",
         executable="static_transform_publisher",
@@ -503,60 +631,11 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[{"use_sim_time": use_sim_time}],
     )
 
-    ekf_odom_node = Node(
-        package="robot_localization",
-        executable="ekf_node",
-        name="ekf_odom_node",
-        output="screen",
-        parameters=[
-            robot_localization_params,
-            {"use_sim_time": use_sim_time},
-        ],
-        remappings=[
-            ("odometry/filtered", "/odometry/filtered"),
-        ],
-    )
-
-    # Datum triple [lat, lon, yaw]. yaw stays 0 — our IMU has no
-    # magnetometer so yaw can't be anchored to true north at boot;
-    # robot yaw will align to GPS track after the first straight
-    # motion, and to dock_pose_yaw at dock reset. Datum lat/lon must
-    # match what was used to save areas / dock pose, otherwise saved
-    # coordinates shift.
-    # navsat_transform_node removed 2026-04-26 — its only output (/odometry/gps)
-    # had no subscribers in the active fusion path. /gps/pose_cov from the
-    # custom navsat_to_absolute_pose_node (which applies the lever-arm
-    # correction with map yaw) is what ekf_map actually fuses.
-    # /gps/filtered (foxglove visualisation) is replaced by /gps/absolute_pose.
-
-    # ekf_map_node — runs whenever fusion_graph is NOT in primary mode.
-    # That covers: use_fusion_graph=false (operator opted out) AND
-    # use_fusion_graph=true but no persisted graph yet (bootstrap
-    # session — fusion_graph builds the graph in observer mode while
-    # ekf_map keeps driving Nav2).
-    ekf_map_node = Node(
-        condition=UnlessCondition(primary_mode),
-        package="robot_localization",
-        executable="ekf_node",
-        name="ekf_map_node",
-        output="screen",
-        parameters=[
-            robot_localization_params,
-            {"use_sim_time": use_sim_time},
-        ],
-        remappings=[
-            ("odometry/filtered", "/odometry/filtered_map"),
-            # robot_localization defaults to a global /set_pose topic shared
-            # by both EKFs. Remap ekf_map's subscription to a node-unique
-            # name so seeding ekf_map does not also reset ekf_odom.
-            ("set_pose", "/ekf_map_node/set_pose"),
-        ],
-    )
-
-    # fusion_graph_node — GTSAM iSAM2 factor-graph localizer (planned
-    # replacement for ekf_map_node). Mutually exclusive with the EKF
-    # above. Reads datum + lever-arm from mowgli_robot.yaml inside the
-    # fusion_graph launch include.
+    # fusion_graph_node — GTSAM iSAM2 factor-graph localizer. Always
+    # primary (no fallback to ekf_map_node, which was removed alongside
+    # the use_fusion_graph flag in this refactor). Works WITHOUT LiDAR
+    # when use_scan_matching=false AND use_loop_closure=false (default).
+    # Reads datum + lever-arm from mowgli_robot.yaml inside the include.
     fusion_graph_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(
@@ -564,39 +643,37 @@ def generate_launch_description() -> LaunchDescription:
                 "launch", "fusion_graph.launch.py",
             )
         ),
-        # Run whenever the operator wants fusion_graph at all — the
-        # primary_mode flag inside the include decides whether it
-        # owns map→odom or just observes.
-        condition=IfCondition(use_fusion_graph),
         launch_arguments={
             "use_sim_time": use_sim_time,
             "use_magnetometer": use_magnetometer,
             "use_scan_matching": use_scan_matching,
             "use_loop_closure": use_loop_closure,
-            "primary_mode": primary_mode,
+            "primary_mode": "true",
+            "tf_publish_lead_s": fusion_graph_tf_lead_s,
+            "node_period_s": fusion_graph_node_period_s,
         }.items(),
     )
 
-    # Seeds ekf_map with the dock heading on rising edges of is_charging.
-    # Fires once per docking event plus once at boot if the robot is
-    # already docked.
-    dock_yaw_to_set_pose = Node(
-        package="mowgli_localization",
-        executable="dock_yaw_to_set_pose",
-        name="dock_yaw_to_set_pose",
-        output="screen",
-        parameters=[
-            {"use_sim_time": use_sim_time,
-             "dock_pose_yaw": dock_pose_yaw,
-             "dock_pose_yaw_sigma_rad": dock_pose_yaw_sigma_rad},
-        ],
-    )
+    # dock_yaw_to_set_pose was inlined into fusion_graph_node
+    # (FusionGraphNode::SeedFromDockPose) on 2026-05-18 — the dock
+    # pose anchor is now applied directly by the localizer on
+    # is_charging rising edge, without a separate node + topic round-trip.
 
     # Publishes GPS course-over-ground as a synthetic sensor_msgs/Imu on
     # /imu/cog_heading so ekf_map_node can fuse it as an absolute-yaw
     # observation. Once the session is seeded and the robot is driving
     # forward faster than min_speed_ms with RTK-Fixed, this node corrects
     # gyro drift every /gps/absolute_pose sample.
+    # cog_to_imu publishes a stationary "anchor" yaw at
+    # stationary_seed_rate_hz Hz when GPS COG cannot be derived
+    # (robot not moving forward). On real hardware this anchors the
+    # fusion_graph yaw across long stationary periods. In sim with
+    # KinematicDrive (which teleports without forward GPS motion),
+    # the anchor pins ekf_map_node's yaw to a stale value and fights
+    # the gyro integration, so a robot in PRE_ROTATE never closes
+    # large heading errors (issue #200). Default 2.0 Hz, overridden
+    # to 0.0 in sim_full_system.launch.py.
+    cog_stationary_rate = LaunchConfiguration("cog_stationary_seed_rate_hz")
     cog_to_imu = Node(
         package="mowgli_localization",
         executable="cog_to_imu",
@@ -607,7 +684,21 @@ def generate_launch_description() -> LaunchDescription:
              "datum_lat": datum_lat,
              "datum_lon": datum_lon,
              "enable_mag_cal": enable_mag_cal,
-             "mag_calibration_path": mag_cal_path},
+             "mag_calibration_path": mag_cal_path,
+             "stationary_seed_rate_hz": cog_stationary_rate,
+             # Stationary-yaw aging penalty. The republish_latched path
+             # adds (rate · age)² to the variance to model the chance
+             # that the latched yaw has gone stale (manual rotation,
+             # gyro bias accumulation) since the last forward-motion
+             # measurement. Upstream default is 0.005 rad/s ≈ 0.29 °/s,
+             # which inflates σ to ~45° after 2-3 min stationary —
+             # aggressive enough that fusion_graph effectively ignores
+             # the seed during normal idle windows. On this chassis the
+             # post-calibration gyro bias drift is closer to 0.01-0.03 °/s,
+             # so 0.001 rad/s (= 0.057 °/s, ~3.4 °/min) is a much closer
+             # match and keeps σ ≈ 9° after 2-3 min — still penalises
+             # manual pushes but lets the EKF actually use the seed.
+             "stationary_yaw_drift_rate": 0.001},
         ],
     )
 
@@ -637,9 +728,59 @@ def generate_launch_description() -> LaunchDescription:
         ],
     )
 
-    # ekf_odom_node subscribes to /wheel_odom directly (see
-    # robot_localization.yaml). ekf_map_node fuses /gps/pose_cov directly
-    # as pose0 (published by navsat_to_absolute_pose_node).
+    # Conditional radial-blank filter for the local_costmap obstacle_layer.
+    # Republishes /scan as /scan_costmap, masking returns < 0.70 m only
+    # while is_charging or for 5 s after charging drops — closes the
+    # 0.10–0.65 m blind ring during mowing while keeping the dock
+    # invisible to BackUp's collision check (behavior_server reads
+    # local_costmap/costmap_raw). collision_monitor still polls /scan
+    # unfiltered and stops the robot on real-time contact.
+    # Motion-compensates the sequential LaserScan rays so a 360° scan
+    # acquired while rotating doesn't appear smeared by ω×scan_period in
+    # the map frame. Output /scan_deskewed feeds the rest of the pipeline.
+    scan_deskew = Node(
+        package="mowgli_localization",
+        executable="scan_deskew_node",
+        name="scan_deskew",
+        output="screen",
+        parameters=[
+            {"use_sim_time": use_sim_time,
+             "input_topic": "/scan",
+             "output_topic": "/scan_deskewed",
+             "imu_topic": "/imu/data",
+             "reference": "end",
+             "imu_max_age_s": 0.5},
+        ],
+    )
+
+    costmap_scan_filter = Node(
+        package="mowgli_localization",
+        executable="costmap_scan_filter_node",
+        name="costmap_scan_filter",
+        output="screen",
+        parameters=[
+            {"use_sim_time": use_sim_time,
+             "input_topic": "/scan_deskewed",
+             "output_topic": "/scan_costmap",
+             "status_topic": "/hardware_bridge/status",
+             # Always-on chassis self-return blank. YardForce 500 chassis
+             # corner reach from LiDAR (mounted at body 0,0.024 above
+             # base_link, chassis 0.60×0.40 centred at +0.18 X):
+             #   front-left corner  (0.48, 0.20) → 0.51 m
+             #   front-right corner (0.48,-0.20) → 0.53 m
+             #   rear-left corner  (-0.12, 0.20) → 0.21 m
+             #   rear-right corner (-0.12,-0.20) → 0.25 m
+             # 0.55 m blanks all four corners + some safety. We lose
+             # real-obstacle detection within 55 cm of the LiDAR, but
+             # collision_monitor PolygonStop (forward extent 0.55 m)
+             # already protects that zone using a polygon-shaped check
+             # downstream. For a 0.3 m/s mower this is acceptable;
+             # tighten if real-obstacle sensitivity is critical.
+             "chassis_blank_range": 0.55,
+             "dock_blank_range": 0.70,
+             "post_undock_blank_sec": 5.0},
+        ],
+    )
 
     # ------------------------------------------------------------------
     # LaunchDescription
@@ -649,19 +790,21 @@ def generate_launch_description() -> LaunchDescription:
             use_sim_time_arg,
             use_ekf_arg,
             use_lidar_arg,
-            use_fusion_graph_arg,
             use_magnetometer_arg,
             use_scan_matching_arg,
             use_loop_closure_arg,
-            primary_mode_arg,
-            # robot_localization dual EKF + helpers
+            cog_stationary_seed_rate_hz_arg,
+            fusion_graph_tf_lead_arg,
+            fusion_graph_node_period_arg,
+            # Localization helpers + fusion_graph_node (single localizer
+            # for both map→odom AND odom→base_footprint; ekf_odom_node
+            # was removed 2026-05-18).
             static_gps_link_alias,
-            ekf_odom_node,
-            ekf_map_node,
             fusion_graph_launch,
-            dock_yaw_to_set_pose,
             cog_to_imu,
             mag_yaw_publisher,
+            scan_deskew,
+            costmap_scan_filter,
             wait_for_map_odom_tf,
             nav2_after_tf,
             empty_static_map_pub,

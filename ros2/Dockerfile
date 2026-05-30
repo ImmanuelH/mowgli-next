@@ -39,6 +39,84 @@ RUN cd gtsam && mkdir build && cd build && \
  && make -j$(nproc) install
 
 # =============================================================================
+# Stage 0b: fields2cover-builder
+# Builds Fields2Cover 2.0.0 from source into /opt/fields2cover-200. The
+# upstream repo (https://github.com/Fields2Cover/Fields2Cover) has no
+# debian package for v2 on Noble. mowgli_coverage's CMakeLists pins
+#   find_package(Fields2Cover 2.0.0 REQUIRED PATHS /opt/fields2cover-200)
+# so the install prefix matters. Runtime stages COPY /opt/fields2cover-200
+# across; libgdal/libgeos/libortools/libtinyxml2 are installed in `base`.
+# =============================================================================
+FROM ros:kilted-ros-base AS fields2cover-builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake git pkg-config \
+      libeigen3-dev libgdal-dev libgeos++-dev libgeos-dev libgsl-dev \
+      libtinyxml2-dev libpython3-dev python3-dev libtbb-dev \
+      ros-kilted-ortools-vendor \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tmp
+RUN git clone --depth 1 -b v2.0.0 https://github.com/Fields2Cover/Fields2Cover.git f2c
+
+RUN . /opt/ros/kilted/setup.sh && \
+    cd f2c && mkdir build && cd build && \
+    cmake .. \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/opt/fields2cover-200 \
+        -DBUILD_TESTS=OFF \
+        -DBUILD_PYTHON=OFF \
+        -DBUILD_TUTORIALS=OFF \
+        -DBUILD_DOC=OFF \
+        -DALLOW_PARALLELIZATION=ON \
+        -DBUILD_SHARED_LIBS=ON \
+ && make -j$(nproc) install
+
+# =============================================================================
+# Stage 0c: ublox-msgs-builder
+# Builds ONLY the ublox_ubx_msgs + ublox_ubx_interfaces interface packages
+# from the cedbossneo/ublox_dgnss fork. The GPS driver runs in the separate
+# sensors/gps image and publishes ~25 /ubx_* topics typed with
+# ublox_ubx_msgs/* and ublox_dgnss services typed with ublox_ubx_interfaces/*.
+# foxglove_bridge in THIS image introspects every topic/service on the graph
+# and was logging one "package not found" error per topic on every reconnect
+# because the schemas weren't installed here. We only need the .msg/.srv
+# typesupport for schema resolution, NOT the driver node — so build just the
+# two interface packages with --packages-up-to (pulls in nothing else; both
+# depend only on builtin_interfaces/std_msgs/rosidl, present in the base).
+#
+# The pinned ref MUST stay identical to sensors/gps/Dockerfile's
+# UBLOX_DGNSS_REF/SHA — a schema mismatch between what the driver publishes
+# and what foxglove loads here would be worse than the current log spam.
+# Bump both Dockerfiles together when the fork moves.
+# =============================================================================
+FROM ros:kilted-ros-base AS ublox-msgs-builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG UBLOX_DGNSS_REF=fix/hp-fix-stale-status-cov
+ARG UBLOX_DGNSS_SHA=5e1d0cf1e8ec0e2638c44a59f57d15f5dd04c9af
+ARG UBLOX_DGNSS_URL=https://github.com/cedbossneo/ublox_dgnss.git
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake git \
+      python3-colcon-common-extensions \
+      ros-kilted-rosidl-default-generators \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /ws/src
+RUN git clone --branch ${UBLOX_DGNSS_REF} ${UBLOX_DGNSS_URL} ublox_dgnss \
+ && cd ublox_dgnss && git checkout ${UBLOX_DGNSS_SHA}
+
+WORKDIR /ws
+RUN . /opt/ros/kilted/setup.sh \
+ && colcon build --merge-install \
+      --packages-up-to ublox_ubx_msgs ublox_ubx_interfaces \
+      --cmake-args -DCMAKE_BUILD_TYPE=Release -Wno-dev \
+ && rm -rf /ws/build /ws/log /ws/src
+
+# =============================================================================
 # Stage 1: base
 # Installs all runtime ROS2 dependencies. Both runtime and simulation stages
 # inherit from here, keeping the image lean.
@@ -100,9 +178,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-kilted-nav2-util \
     # Nav2 msgs (CostmapFilterInfo for costmap filters)
     ros-kilted-nav2-msgs \
-    # Simulation bridge (needed at runtime for ros_gz_bridge topic bridging)
-    ros-kilted-ros-gz-sim \
-    ros-kilted-ros-gz-bridge \
     # DDS middleware — Cyclone DDS is more reliable than FastRTPS on ARM
     # (no shared memory, no stale /dev/shm segments, better service discovery)
     ros-kilted-rmw-cyclonedds-cpp \
@@ -112,6 +187,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # that GTSAM's exported CMake target references at link time.
     # libboost-* runtime libs are pulled in transitively.
     libmetis-dev \
+    # Fields2Cover 2.0.0 runtime deps. libFields2Cover.so links
+    # against libgdal, libgeos_c, libortools, libtinyxml2 + bundles
+    # its own libsteering_functions and libmatplot under
+    # /opt/fields2cover-200/lib. -dev variants are needed because
+    # mowgli_coverage's find_package pulls in transitive headers via
+    # the exported Fields2Cover CMake target.
+    libgdal-dev libgeos++-dev libtinyxml2-dev libtbb12 \
+    ros-kilted-ortools-vendor \
     # Utilities
     python3-argcomplete \
  && rm -rf /var/lib/apt/lists/*
@@ -123,6 +206,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=gtsam-builder /opt/gtsam /opt/gtsam
 RUN echo '/opt/gtsam/lib' > /etc/ld.so.conf.d/gtsam.conf && ldconfig
 ENV CMAKE_PREFIX_PATH=/opt/gtsam:${CMAKE_PREFIX_PATH}
+
+# Pull source-built Fields2Cover 2.0.0 into /opt/fields2cover-200.
+# mowgli_coverage's CMakeLists pins PATHS /opt/fields2cover-200 in
+# find_package(Fields2Cover 2.0.0 REQUIRED), so the install prefix is
+# what matters — no CMAKE_PREFIX_PATH change needed. Register its
+# /opt/fields2cover-200/lib with ldconfig so the runtime loader
+# resolves libFields2Cover.so + libsteering_functions.so + libmatplot.so.1.
+COPY --from=fields2cover-builder /opt/fields2cover-200 /opt/fields2cover-200
+RUN echo '/opt/fields2cover-200/lib' > /etc/ld.so.conf.d/fields2cover-200.conf && ldconfig
 
 # =============================================================================
 # Stage 2: deps
@@ -171,6 +263,12 @@ COPY src/fusion_graph/package.xml         src/fusion_graph/package.xml
 COPY src/fusion_graph/CMakeLists.txt      src/fusion_graph/CMakeLists.txt
 # fusion_graph is the opt-in factor-graph replacement for ekf_map_node;
 # depends on libgtsam-dev installed in the base stage.
+COPY src/mowgli_coverage/package.xml      src/mowgli_coverage/package.xml
+COPY src/mowgli_coverage/CMakeLists.txt   src/mowgli_coverage/CMakeLists.txt
+# opennav_coverage submodule provides opennav_coverage_msgs (action types
+# consumed by mowgli_coverage). Pulled by checkout submodules: recursive.
+COPY src/opennav_coverage/opennav_coverage_msgs/package.xml    src/opennav_coverage/opennav_coverage_msgs/package.xml
+COPY src/opennav_coverage/opennav_coverage_msgs/CMakeLists.txt src/opennav_coverage/opennav_coverage_msgs/CMakeLists.txt
 
 # Resolve rosdep dependencies (cached until package.xml changes)
 RUN rosdep update --rosdistro kilted \
@@ -209,6 +307,18 @@ ARG BUILD_TYPE=Release
 
 # Now copy the rest of the source tree
 COPY src/ src/
+
+# Skip every opennav_coverage subpackage except _msgs. The upstream server
+# is pinned to F2C 1.2.1 (no TrapezoidalDecomp / generateHeadlandSwaths /
+# planPathForConnection); we use mowgli_coverage with F2C 2.0 instead, and
+# only need the action types from opennav_coverage_msgs. Marker files
+# aren't tracked in the submodule, so create them here.
+RUN touch \
+      src/opennav_coverage/opennav_coverage/COLCON_IGNORE \
+      src/opennav_coverage/opennav_coverage_bt/COLCON_IGNORE \
+      src/opennav_coverage/opennav_coverage_demo/COLCON_IGNORE \
+      src/opennav_coverage/opennav_coverage_navigator/COLCON_IGNORE \
+      src/opennav_coverage/opennav_row_coverage/COLCON_IGNORE
 
 # Build all packages (mowgli_interfaces is already built and cached)
 RUN /bin/bash -c "\
@@ -249,6 +359,14 @@ RUN reallib=$(find /usr/lib -name 'libtinyxml2.so.*.*.*' | head -1) && \
 # Pull compiled install tree from the build stage
 COPY --from=build /ros2_ws/install/ install/
 
+# Pull the ublox_ubx_msgs + ublox_ubx_interfaces typesupport built from the
+# cedbossneo/ublox_dgnss fork (see ublox-msgs-builder stage). The GPS driver
+# runs in the separate sensors/gps image, so these message/service packages
+# aren't otherwise present here — without them foxglove_bridge logs one
+# "package not found" schema error per /ubx_* topic + ublox_dgnss service on
+# every client reconnect. Sourced by ros2_entrypoint.sh as a ROS overlay.
+COPY --from=ublox-msgs-builder /ws/install /opt/ublox_msgs
+
 # Copy all launch files and config from every package
 COPY src/mowgli_bringup/launch/    /ros2_ws/install/mowgli_bringup/share/mowgli_bringup/launch/
 COPY src/mowgli_bringup/config/    /ros2_ws/install/mowgli_bringup/share/mowgli_bringup/config/
@@ -280,20 +398,21 @@ CMD ["ros2", "launch", "mowgli_bringup", "mowgli.launch.py"]
 
 # =============================================================================
 # Stage 6: simulation
-# Extends runtime with a full Gazebo installation for headless/web simulation.
+# Extends runtime with the Webots simulator for headless/web simulation.
+#
+# NOTE: This stage is mid-migration from Gazebo Ignition to Webots. The
+# Gazebo apt packages have been removed; the Webots binary + ROS2 driver
+# install steps are TODO (Phase 2 of the Webots migration). Running the
+# simulation image as-is will fail until Webots is installed here.
 # =============================================================================
 FROM runtime AS simulation
 
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Gazebo Harmonic comes via ros-kilted-ros-gz-sim (Jazzy default pairing)
-    ros-kilted-ros-gz-sim \
-    ros-kilted-ros-gz-bridge \
-    ros-kilted-ros-gz-interfaces \
     # Headless rendering (sensors need a virtual display when no GPU)
     xvfb \
-    # VNC + lightweight desktop for Gazebo GUI access from macOS
+    # VNC + lightweight desktop for sim GUI access from macOS
     tigervnc-standalone-server \
     tigervnc-common \
     novnc \
@@ -301,6 +420,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openbox \
     xterm \
     x11-utils \
+    # TODO(webots): install Webots binary + ros-kilted-webots-ros2-driver
  && rm -rf /var/lib/apt/lists/*
 
 # Copy VNC startup script
@@ -313,7 +433,7 @@ COPY foxglove/ /ros2_ws/foxglove/
 
 # Foxglove Bridge WebSocket port
 EXPOSE 8765
-# noVNC web port (Gazebo GUI via browser)
+# noVNC web port (sim GUI via browser)
 EXPOSE 6080
 
 CMD ["ros2", "launch", "mowgli_bringup", "sim_full_system.launch.py", "headless:=true", "use_rviz:=false"]

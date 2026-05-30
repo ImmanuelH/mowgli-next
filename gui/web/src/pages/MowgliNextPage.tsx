@@ -3,13 +3,13 @@ import {useIsMobile} from "../hooks/useIsMobile";
 import {useHighLevelStatus} from "../hooks/useHighLevelStatus.ts";
 import {usePower} from "../hooks/usePower.ts";
 import {useStatus} from "../hooks/useStatus.ts";
-import {useGPS} from "../hooks/useGPS.ts";
+import {useGnssStatus} from "../hooks/useGnssStatus.ts";
 import {useEmergency} from "../hooks/useEmergency.ts";
 import {useSettings} from "../hooks/useSettings.ts";
 import {useMowerAction} from "../components/MowerActions.tsx";
 import {useThemeMode} from "../theme/ThemeContext.tsx";
 import {computeBatteryPercent} from "../utils/battery.ts";
-import {AbsolutePoseConstants} from "../types/ros.ts";
+import {deriveGpsStatus} from "../utils/gpsStatus.ts";
 import {
   HeroCard, DashTile, DashCard,
   IconBattery, IconSignal, IconBlades, IconThermo, IconSchedule, IconDiag,
@@ -24,7 +24,7 @@ function useMowerData() {
   const {highLevelStatus} = useHighLevelStatus();
   const power = usePower();
   const status = useStatus();
-  const gps = useGPS();
+  const gnss = useGnssStatus();
   const emergency = useEmergency();
   const {settings} = useSettings();
 
@@ -35,17 +35,7 @@ function useMowerData() {
     highLevelStatus.battery_percent, power.v_battery, settings,
   );
 
-  const gpsQuality = (() => {
-    if (highLevelStatus.gps_quality_percent != null && highLevelStatus.gps_quality_percent > 0) {
-      return highLevelStatus.gps_quality_percent * 100;
-    }
-    if (gps.flags != null) {
-      if (gps.flags & AbsolutePoseConstants.FLAG_GPS_RTK_FIXED) return 100;
-      if (gps.flags & AbsolutePoseConstants.FLAG_GPS_RTK_FLOAT) return 50;
-      if (gps.flags & AbsolutePoseConstants.FLAG_GPS_RTK) return 25;
-    }
-    return 0;
-  })();
+  const gpsStatus = deriveGpsStatus(gnss);
 
   const stateName = highLevelStatus.state_name ?? (
     isEmergency ? "EMERGENCY" :
@@ -66,7 +56,8 @@ function useMowerData() {
     battery: batteryPercent,
     charging: isCharging,
     emergency: isEmergency,
-    gps: gpsQuality,
+    gps: gpsStatus.percent,
+    gpsLabel: gpsStatus.label,
     vBattery: power.v_battery ?? 0,
     current: power.charge_current ?? 0,
     rpm: status.mower_motor_rpm ?? 0,
@@ -117,12 +108,7 @@ export const MowgliNextPage = () => {
     currentArea: data.currentArea,
   };
 
-  const gpsHint = (() => {
-    if (data.gps >= 100) return 'RTK fixed';
-    if (data.gps >= 50) return 'RTK float';
-    if (data.gps > 0) return 'GPS fix';
-    return 'No GPS';
-  })();
+  const gpsHint = data.gpsLabel;
 
   if (isMobile) {
     return (

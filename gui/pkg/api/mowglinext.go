@@ -42,7 +42,29 @@ func MowgliNextRoutes(r *gin.RouterGroup, provider types.IRosProvider) {
 	ClearMapRoute(group, provider)
 	ReplaceMapRoute(group, provider)
 	SubscriberRoute(group, provider)
+	MultiplexRoute(group, provider)
 	PublisherRoute(group, provider)
+}
+
+// topicSubscribeInterval returns the throttle interval (ms, -1 = unthrottled)
+// for a known logical topic. Mirrors the per-topic intervals used by
+// SubscriberRoute. The bool flag is false for unknown topics so the
+// multiplex path can ignore subscribe ops for them instead of leaking
+// goroutines on bad input.
+func topicSubscribeInterval(topic string) (int, bool) {
+	switch topic {
+	case "gps", "gnssStatus", "pose", "imu", "ticks", "wheelOdom", "lidar":
+		return 100, true
+	case "fusionRaw", "cogHeading", "magYaw":
+		return 200, true
+	case "diagnostics", "status", "highLevelStatus", "btLog", "map",
+		"path", "plan", "power", "emergency", "dockingSensor",
+		"robotDescription", "coverageCells", "recordingTrajectory",
+		"obstacles", "fusionDiag":
+		return -1, true
+	default:
+		return -1, false
+	}
 }
 
 // AddMapAreaRoute add a map area
@@ -102,6 +124,41 @@ func ClearMapRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 	})
 }
 
+// replaceMapInternal is the ROS-side flow shared by the public PUT
+// handler and the OpenMower importer. It does clear_map → add_area×N →
+// save_areas; the wrapping (HTTP body decode / response codes) is the
+// caller's job.
+//
+// The save_areas error is annotated so callers can distinguish a
+// partial-success (areas live but not persisted to disk) from a hard
+// failure earlier in the sequence.
+func replaceMapInternal(ctx context.Context, provider types.IRosProvider, req *mowgli.ReplaceMapReq) error {
+	if req == nil {
+		return errors.New("replaceMapInternal: nil request")
+	}
+	if err := provider.CallService(ctx, "/map_server_node/clear_map", &mowgli.ClearMapReq{}, &mowgli.ClearMapRes{}, "std_srvs/srv/Trigger"); err != nil {
+		return err
+	}
+	for _, element := range req.Areas {
+		// Ensure Obstacles is an empty slice, not nil — the bridge rejects
+		// null for repeated fields ("msg is not a list type").
+		if element.Area.Obstacles == nil {
+			element.Area.Obstacles = []geometry.Polygon{}
+		}
+		areaReq := mowgli.AddMowingAreaReq{
+			Area:             element.Area,
+			IsNavigationArea: element.IsNavigationArea,
+		}
+		if err := provider.CallService(ctx, "/map_server_node/add_area", &areaReq, &mowgli.AddMowingAreaRes{}, "mowgli_interfaces/srv/AddMowingArea"); err != nil {
+			return err
+		}
+	}
+	if err := provider.CallService(ctx, "/map_server_node/save_areas", &mowgli.ClearMapReq{}, &mowgli.ClearMapRes{}, "std_srvs/srv/Trigger"); err != nil {
+		return fmt.Errorf("areas added but save_areas failed: %w", err)
+	}
+	return nil
+}
+
 // ReplaceMapRoute clear the map and insert areas
 //
 // @Summary Delete the current map and replace all areas
@@ -118,44 +175,27 @@ func ReplaceMapRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 		defer cancel()
 
-		err := provider.CallService(ctx, "/map_server_node/clear_map", &mowgli.ClearMapReq{}, &mowgli.ClearMapRes{}, "std_srvs/srv/Trigger")
-		if err != nil {
-			c.JSON(500, ErrorResponse{Error: err.Error()})
-			return
-		}
-
 		var CallReq mowgli.ReplaceMapReq
-		err = unmarshalROSMessage[*mowgli.ReplaceMapReq](c.Request.Body, &CallReq)
-		if err != nil {
+		if err := unmarshalROSMessage[*mowgli.ReplaceMapReq](c.Request.Body, &CallReq); err != nil {
 			c.JSON(500, ErrorResponse{Error: err.Error()})
 			return
 		}
-		for _, element := range CallReq.Areas {
-			// Ensure Obstacles is an empty slice, not nil — the bridge
-			// rejects null for repeated fields ("msg is not a list type").
-			if element.Area.Obstacles == nil {
-				element.Area.Obstacles = []geometry.Polygon{}
-			}
-			areaReq := mowgli.AddMowingAreaReq{
-				Area:             element.Area,
-				IsNavigationArea: element.IsNavigationArea,
-			}
-			err = provider.CallService(ctx, "/map_server_node/add_area", &areaReq, &mowgli.AddMowingAreaRes{}, "mowgli_interfaces/srv/AddMowingArea")
-			if err != nil {
-				c.JSON(500, ErrorResponse{Error: err.Error()})
-				return
-			}
-		}
-
-		// Persist areas to disk so they survive container restarts
-		err = provider.CallService(ctx, "/map_server_node/save_areas", &mowgli.ClearMapReq{}, &mowgli.ClearMapRes{}, "std_srvs/srv/Trigger")
-		if err != nil {
-			c.JSON(500, ErrorResponse{Error: fmt.Sprintf("areas added but save_areas failed: %v", err)})
+		if err := replaceMapInternal(ctx, provider, &CallReq); err != nil {
+			c.JSON(500, ErrorResponse{Error: err.Error()})
 			return
 		}
-
 		c.JSON(200, OkResponse{})
 	})
+}
+
+// setDockingPointInternal is the ROS-side call shared by the public
+// POST handler and the OpenMower importer. Single service round-trip,
+// no wrapping logic.
+func setDockingPointInternal(ctx context.Context, provider types.IRosProvider, req *mowgli.SetDockingPointReq) error {
+	if req == nil {
+		return errors.New("setDockingPointInternal: nil request")
+	}
+	return provider.CallService(ctx, "/map_server_node/set_docking_point", req, &mowgli.SetDockingPointRes{}, "mowgli_interfaces/srv/SetDockingPoint")
 }
 
 // SetDockingPointRoute set the docking point
@@ -175,16 +215,15 @@ func SetDockingPointRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 		defer cancel()
 
 		var CallReq mowgli.SetDockingPointReq
-		err := unmarshalROSMessage[*mowgli.SetDockingPointReq](c.Request.Body, &CallReq)
-		if err != nil {
+		if err := unmarshalROSMessage[*mowgli.SetDockingPointReq](c.Request.Body, &CallReq); err != nil {
+			c.JSON(500, ErrorResponse{Error: err.Error()})
 			return
 		}
-		err = provider.CallService(ctx, "/map_server_node/set_docking_point", &CallReq, &mowgli.SetDockingPointRes{}, "mowgli_interfaces/srv/SetDockingPoint")
-		if err != nil {
+		if err := setDockingPointInternal(ctx, provider, &CallReq); err != nil {
 			c.JSON(500, ErrorResponse{Error: err.Error()})
-		} else {
-			c.JSON(200, OkResponse{})
+			return
 		}
+		c.JSON(200, OkResponse{})
 	})
 }
 
@@ -193,7 +232,7 @@ func SetDockingPointRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 // @Summary subscribe to a topic
 // @Description subscribe to a topic
 // @Tags mowglinext
-// @Param topic path string true "logical topic key: diagnostics, status, highLevelStatus, gps, pose, imu, ticks, map, path, plan, mowingPath, power, emergency, dockingSensor, lidar"
+// @Param topic path string true "logical topic key: diagnostics, status, highLevelStatus, gps, gnssStatus, pose, imu, ticks, map, path, plan, mowingPath, power, emergency, dockingSensor, lidar"
 // @Router /mowglinext/subscribe/{topic} [get]
 func SubscriberRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 	group.GET("/subscribe/:topic", func(c *gin.Context) {
@@ -215,6 +254,8 @@ func SubscriberRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 			def, err = subscribe(provider, c, conn, "highLevelStatus", -1)
 		case "gps":
 			def, err = subscribe(provider, c, conn, "gps", 100)
+		case "gnssStatus":
+			def, err = subscribe(provider, c, conn, "gnssStatus", 100)
 		case "pose":
 			def, err = subscribe(provider, c, conn, "pose", 100)
 		case "fusionRaw":
@@ -225,6 +266,8 @@ func SubscriberRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 			def, err = subscribe(provider, c, conn, "imu", 100)
 		case "ticks":
 			def, err = subscribe(provider, c, conn, "ticks", 100)
+		case "wheelOdom":
+			def, err = subscribe(provider, c, conn, "wheelOdom", 100)
 		case "map":
 			def, err = subscribe(provider, c, conn, "map", -1)
 		case "path":
@@ -303,6 +346,131 @@ func PublisherRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 				log.Printf("PublisherRoute: publish error: %v", err)
 				// Don't break — foxglove may reconnect; keep the browser WebSocket alive
 				continue
+			}
+		}
+	})
+}
+
+// MultiplexRoute multiplexes any number of topic subscriptions over one
+// WebSocket so a single browser tab does not need ~25 simultaneous TCP
+// connections. Wire format:
+//
+//	client → server: {"op": "subscribe"|"unsubscribe", "topic": "<key>"}
+//	server → client: {"topic": "<key>", "data": "<base64>"}
+//
+// Per-topic throttling reuses topicSubscribeInterval. Unknown topics are
+// ignored. On disconnect, all live subscriptions are released.
+//
+// @Summary multiplexed topic subscription
+// @Description multiplexed topic subscription
+// @Tags mowglinext
+// @Router /mowglinext/multiplex [get]
+func MultiplexRoute(group *gin.RouterGroup, provider types.IRosProvider) {
+	group.GET("/multiplex", func(c *gin.Context) {
+		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		type subState struct {
+			id string
+		}
+		var stateMu sync.Mutex
+		state := map[string]*subState{}
+
+		var writeMu sync.Mutex
+		writeFrame := func(topic string, data []byte) {
+			frame := map[string]string{
+				"topic": topic,
+				"data":  base64.StdEncoding.EncodeToString(data),
+			}
+			payload, err := json.Marshal(frame)
+			if err != nil {
+				return
+			}
+			writeMu.Lock()
+			defer writeMu.Unlock()
+			_ = conn.WriteMessage(websocket.TextMessage, payload)
+		}
+
+		subscribeTopic := func(topic string) {
+			interval, known := topicSubscribeInterval(topic)
+			if !known {
+				log.Printf("MultiplexRoute: ignoring unknown topic %q", topic)
+				return
+			}
+			stateMu.Lock()
+			if _, exists := state[topic]; exists {
+				stateMu.Unlock()
+				return
+			}
+			id := uuid.Generate().String()
+			state[topic] = &subState{id: id}
+			stateMu.Unlock()
+
+			err := provider.Subscribe(topic, id, func(msg []byte) {
+				if interval > 0 {
+					time.Sleep(time.Duration(interval) * time.Millisecond)
+				}
+				writeFrame(topic, msg)
+			})
+			if err != nil {
+				log.Printf("MultiplexRoute: subscribe %s: %v", topic, err)
+				stateMu.Lock()
+				delete(state, topic)
+				stateMu.Unlock()
+			}
+		}
+
+		unsubscribeTopic := func(topic string) {
+			stateMu.Lock()
+			s, ok := state[topic]
+			delete(state, topic)
+			stateMu.Unlock()
+			if ok {
+				provider.UnSubscribe(topic, s.id)
+			}
+		}
+
+		// Drain all subscriptions when the connection closes.
+		defer func() {
+			stateMu.Lock()
+			snapshot := make([]struct {
+				topic string
+				id    string
+			}, 0, len(state))
+			for topic, s := range state {
+				snapshot = append(snapshot, struct {
+					topic string
+					id    string
+				}{topic, s.id})
+			}
+			state = map[string]*subState{}
+			stateMu.Unlock()
+			for _, s := range snapshot {
+				provider.UnSubscribe(s.topic, s.id)
+			}
+		}()
+
+		type clientMsg struct {
+			Op    string `json:"op"`
+			Topic string `json:"topic"`
+		}
+		for {
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var m clientMsg
+			if err := json.Unmarshal(payload, &m); err != nil {
+				continue
+			}
+			switch m.Op {
+			case "subscribe":
+				subscribeTopic(m.Topic)
+			case "unsubscribe":
+				unsubscribeTopic(m.Topic)
 			}
 		}
 	})
@@ -400,6 +568,30 @@ func ServiceRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 			}
 			if err == nil {
 				c.JSON(200, map[string]interface{}{"message": res.Message})
+				return
+			}
+		case "promote_obstacle":
+			// Convert a transient /obstacle_tracker/obstacles observation
+			// (or a free-form polygon) into a persistent keepout for one
+			// of the mowing areas. After the obstacle-tracker decouple
+			// (#6), this is the only path that mutates obstacle_polygons_;
+			// auto-promotion is gone.
+			var CallReq mowgli.PromoteObstacleReq
+			err = c.BindJSON(&CallReq)
+			if err != nil {
+				return
+			}
+			var promoteRes mowgli.PromoteObstacleRes
+			err = provider.CallService(c.Request.Context(),
+				"/map_server_node/promote_obstacle",
+				&CallReq,
+				&promoteRes,
+				"mowgli_interfaces/srv/PromoteObstacle")
+			if err == nil && !promoteRes.Success {
+				err = errors.New(promoteRes.Message)
+			}
+			if err == nil {
+				c.JSON(200, map[string]interface{}{"message": promoteRes.Message})
 				return
 			}
 		case "fusion_graph_save", "fusion_graph_clear":

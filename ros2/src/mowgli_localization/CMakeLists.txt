@@ -18,6 +18,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ---------------------------------------------------------------------------
 
 find_package(ament_cmake        REQUIRED)
+find_package(diagnostic_msgs    REQUIRED)
 find_package(rclcpp             REQUIRED)
 find_package(nav_msgs           REQUIRED)
 find_package(geometry_msgs      REQUIRED)
@@ -64,12 +65,15 @@ ament_target_dependencies(wheel_odometry_node
 # ---------------------------------------------------------------------------
 
 add_executable(navsat_to_absolute_pose_node
+  src/gnss_runtime_state_builder.cpp
+  src/gnss_status_adapter.cpp
   src/navsat_to_absolute_pose_node.cpp
 )
 
 target_include_directories(navsat_to_absolute_pose_node PUBLIC ${INCLUDE_DIR})
 
 ament_target_dependencies(navsat_to_absolute_pose_node
+  diagnostic_msgs
   rclcpp
   sensor_msgs
   geometry_msgs
@@ -105,6 +109,8 @@ add_executable(cog_to_imu
   src/cog_to_imu_node.cpp
 )
 
+target_include_directories(cog_to_imu PUBLIC ${INCLUDE_DIR})
+
 ament_target_dependencies(cog_to_imu
   rclcpp
   nav_msgs
@@ -132,22 +138,8 @@ ament_target_dependencies(mag_yaw_publisher
 
 target_link_libraries(mag_yaw_publisher yaml-cpp)
 
-# ---------------------------------------------------------------------------
-# Executable: dock_yaw_to_set_pose (ported from dock_yaw_to_set_pose.py)
-# ---------------------------------------------------------------------------
-
-add_executable(dock_yaw_to_set_pose
-  src/dock_yaw_to_set_pose_node.cpp
-)
-
-ament_target_dependencies(dock_yaw_to_set_pose
-  rclcpp
-  geometry_msgs
-  sensor_msgs
-  mowgli_interfaces
-)
-
-target_link_libraries(dock_yaw_to_set_pose yaml-cpp)
+# dock_yaw_to_set_pose was inlined into fusion_graph_node (2026-05-18)
+# — see FusionGraphNode::SeedFromDockPose in fusion_graph/src/.
 
 # ---------------------------------------------------------------------------
 # Executable: calibrate_imu_yaw_node (ported from calibrate_imu_yaw_node.py)
@@ -168,6 +160,38 @@ ament_target_dependencies(calibrate_imu_yaw_node
 target_link_libraries(calibrate_imu_yaw_node yaml-cpp)
 
 # ---------------------------------------------------------------------------
+# Executable: costmap_scan_filter_node (conditional radial blank for the
+# local_costmap obstacle_layer — masks the dock while charging without
+# opening a 0.10–0.65 m blind ring during normal mowing)
+# ---------------------------------------------------------------------------
+
+add_executable(costmap_scan_filter_node
+  src/costmap_scan_filter_node.cpp
+)
+
+ament_target_dependencies(costmap_scan_filter_node
+  rclcpp
+  sensor_msgs
+  mowgli_interfaces
+)
+
+# ---------------------------------------------------------------------------
+# Executable: scan_deskew_node (motion-compensate sequential LaserScan rays
+# acquired while the robot is rotating — undoes the per-scan ~5° smear at
+# normal turn rates so collision_monitor and the costmap obstacle layer see
+# stationary obstacles instead of jittering ones)
+# ---------------------------------------------------------------------------
+
+add_executable(scan_deskew_node
+  src/scan_deskew_node.cpp
+)
+
+ament_target_dependencies(scan_deskew_node
+  rclcpp
+  sensor_msgs
+)
+
+# ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
 
@@ -183,8 +207,9 @@ install(
     localization_monitor_node
     cog_to_imu
     mag_yaw_publisher
-    dock_yaw_to_set_pose
     calibrate_imu_yaw_node
+    costmap_scan_filter_node
+    scan_deskew_node
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
@@ -223,6 +248,53 @@ if(BUILD_TESTING)
   target_include_directories(test_wheel_odometry PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
+
+  # ---- test_cog_yaw_math ----
+  # Pure C++ test of the COG-to-body-heading algebra (cog_yaw_math.hpp).
+  # Guards the 2026-05-27 reverse+rotate yaw fix — no ROS2 deps, link gtest.
+  ament_add_gtest(test_cog_yaw_math
+    test/test_cog_yaw_math.cpp
+  )
+
+  target_include_directories(test_cog_yaw_math PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+
+  # ---- test_costmap_scan_filter ----
+  # Re-implements the static helper so we don't drag rclcpp/main symbols
+  # into the test binary; the helper is small enough to keep in sync by
+  # eye and a regression there will trigger a test failure here.
+  ament_add_gtest(test_costmap_scan_filter
+    test/test_costmap_scan_filter.cpp
+  )
+  ament_target_dependencies(test_costmap_scan_filter
+    sensor_msgs
+  )
+
+  ament_add_gtest(test_gnss_status_adapter
+    test/test_gnss_status_adapter.cpp
+    src/gnss_status_adapter.cpp
+  )
+  ament_target_dependencies(test_gnss_status_adapter
+    rclcpp
+    mowgli_interfaces
+  )
+  target_include_directories(test_gnss_status_adapter PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+
+  ament_add_gtest(test_gnss_runtime_state_builder
+    test/test_gnss_runtime_state_builder.cpp
+    src/gnss_runtime_state_builder.cpp
+  )
+  ament_target_dependencies(test_gnss_runtime_state_builder
+    diagnostic_msgs
+    rclcpp
+    sensor_msgs
+  )
+  target_include_directories(test_gnss_runtime_state_builder PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
 endif()
 
 # ---------------------------------------------------------------------------
@@ -232,6 +304,7 @@ endif()
 ament_export_include_directories(include)
 ament_export_dependencies(
   rclcpp
+  diagnostic_msgs
   nav_msgs
   geometry_msgs
   sensor_msgs

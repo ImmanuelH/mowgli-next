@@ -25,7 +25,7 @@ Brings up all subsystems:
   3. Behavior tree node       — mowgli_behavior
   4. Map server               — mowgli_map
   5. Wheel odometry            — mowgli_localization
-  6. NavSat converter          — mowgli_localization (GPS for GUI/BT)
+  6. NavSat converter          — mowgli_localization (/gps/absolute_pose, /gps/status, /gps/pose_cov)
   7. Localization monitor      — mowgli_localization
   8. Diagnostics               — mowgli_monitoring
   9. MQTT bridge (optional)   — mowgli_monitoring
@@ -70,9 +70,7 @@ def generate_launch_description() -> LaunchDescription:
             with open(_runtime_cfg_path, "r") as _f:
                 _cfg = yaml.safe_load(_f) or {}
             _rp = _cfg.get("mowgli", {}).get("ros__parameters", {})
-            if "use_lidar" in _rp:
-                _early_use_lidar = "true" if bool(_rp["use_lidar"]) else "false"
-            elif "lidar_enabled" in _rp:
+            if "lidar_enabled" in _rp:
                 _early_use_lidar = "true" if bool(_rp["lidar_enabled"]) else "false"
         except yaml.YAMLError:
             pass
@@ -154,7 +152,6 @@ def generate_launch_description() -> LaunchDescription:
     behavior_params = os.path.join(behavior_dir, "config", "behavior_tree.yaml")
     map_params = os.path.join(map_dir, "config", "map_server.yaml")
     nav2_params_file = os.path.join(bringup_dir, "config", "nav2_params.yaml")
-    localization_params = os.path.join(bringup_dir, "config", "robot_localization.yaml")
     monitoring_params = os.path.join(monitoring_dir, "config", "diagnostics.yaml")
     mqtt_params = os.path.join(monitoring_dir, "config", "mqtt_bridge.yaml")
     # Robot-specific config (bind-mounted from mowgli-docker/config/mowgli/)
@@ -210,6 +207,10 @@ def generate_launch_description() -> LaunchDescription:
             # so they appear on the GUI Settings page.
             {"tick_rate": float(robot_params.get("tick_rate", 10.0))},
             {"bt_debug_logging": bool(robot_params.get("bt_debug_logging", False))},
+            # undock_speed is consumed by the BackUp BT instances via
+            # the {undock_speed} blackboard reference in main_tree.xml.
+            # See issue #191.
+            {"undock_speed": float(robot_params.get("undock_speed", 0.15))},
         ],
     )
 
@@ -224,6 +225,24 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[
             map_params,
             {"use_sim_time": use_sim_time},
+            # Dock pose + body geometry from mowgli_robot.yaml. Without
+            # these the map_server uses C++ defaults (0,0,0) and builds
+            # an axis-aligned polygon at the map origin — wrong unless
+            # the dock happens to be exactly there. The hardware_bridge
+            # already receives the same dock_pose_*; here we forward to
+            # the planner / keepout-mask path too.
+            {"dock_pose_x": float(robot_params.get("dock_pose_x", 0.0))},
+            {"dock_pose_y": float(robot_params.get("dock_pose_y", 0.0))},
+            {"dock_pose_yaw": float(robot_params.get("dock_pose_yaw", 0.0))},
+            {"dock_body_length_m": float(robot_params.get("dock_body_length_m", 0.80))},
+            {"dock_body_width_m": float(robot_params.get("dock_body_width_m", 0.55))},
+            # Bypass-arc planner geometry — lifted from physical/operational
+            # sections of mowgli_robot.yaml so the cleaning-robot detour
+            # around discrete obstacles uses the correct robot footprint
+            # and the wall-vs-obstacle threshold operators tune per site.
+            {"chassis_width": float(robot_params.get("chassis_width", 0.40))},
+            {"max_obstacle_avoidance_distance":
+                float(robot_params.get("max_obstacle_avoidance_distance", 2.0))},
         ],
     )
 
@@ -236,21 +255,28 @@ def generate_launch_description() -> LaunchDescription:
     # publisher for /wheel_odom. Keep the source in the package for now
     # (disabled) and rely on hardware_bridge alone.
     # ------------------------------------------------------------------
-    # 7a. NavSat → AbsolutePose converter (for GUI + BT)
+    # 7a. NavSat adapter for legacy AbsolutePose + typed GNSS status
     # navsat_transform_node takes /gps/fix directly for the EKF pipeline;
-    # this node publishes a parallel /gps/absolute_pose (Mowgli-specific
-    # message) for the GUI/BT, and /gps/pose_cov which ekf_map_node fuses.
+    # this node publishes /gps/status through the shared GNSS adapter,
+    # keeps /gps/absolute_pose for legacy consumers, and emits /gps/pose_cov
+    # for ekf_map_node fusion.
     # ------------------------------------------------------------------
     datum_lat = float(robot_params.get("datum_lat", 0.0))
     datum_lon = float(robot_params.get("datum_lon", 0.0))
+    gnss_backend = os.environ.get("GNSS_BACKEND", "gps")
+    gps_protocol = os.environ.get("GPS_PROTOCOL", "UBX")
     navsat_converter_node = Node(
         package="mowgli_localization",
         executable="navsat_to_absolute_pose_node",
         name="navsat_to_absolute_pose",
         output="screen",
         parameters=[
-            localization_params,
-            {"datum_lat": datum_lat, "datum_lon": datum_lon},
+            {
+                "datum_lat": datum_lat,
+                "datum_lon": datum_lon,
+                "gnss_backend": gnss_backend,
+                "gps_protocol": gps_protocol,
+            },
             {"use_sim_time": use_sim_time},
         ],
     )
@@ -264,7 +290,6 @@ def generate_launch_description() -> LaunchDescription:
         name="localization_monitor_node",
         output="screen",
         parameters=[
-            localization_params,
             {"use_sim_time": use_sim_time},
         ],
     )
@@ -352,9 +377,10 @@ def generate_launch_description() -> LaunchDescription:
 
     # Obstacle tracker — DBSCAN-clusters LiDAR obstacle returns from the
     # global costmap, promotes clusters to PERSISTENT after
-    # persistence_threshold (60 s) of stable observation, and publishes
-    # them on /obstacle_tracker/obstacles. map_server_node consumes
-    # those, marks the impacted cells OBSTACLE_PERMANENT in the
+    # `persistence_threshold` seconds (see obstacle_tracker.yaml) of
+    # stable observation, and publishes them on
+    # /obstacle_tracker/obstacles. map_server_node consumes those,
+    # marks the impacted cells OBSTACLE_PERMANENT in the
     # classification layer, republishes the keepout mask so the global
     # costmap routes around them, and triggers a replan so the BT
     # picks up new strips that avoid the obstacle. Transient obstacles
@@ -363,11 +389,12 @@ def generate_launch_description() -> LaunchDescription:
     #
     # Was disabled in launch in an earlier iteration because the
     # tracker promoted too aggressively and produced large persistent
-    # obstacles from grass/ground returns. Re-enabled now that the
-    # yaml has been retuned: min_cluster_points 5, min_obstacle_radius
-    # 8 cm, persistence_threshold 60 s, inflation_radius 10 cm. Toggle
-    # off via the use_obstacle_tracker launch arg if it misbehaves
-    # again on real grass.
+    # obstacles from grass/ground returns. Re-enabled with the
+    # currently-shipping tuning in obstacle_tracker.yaml
+    # (persistence_threshold 10 s; tightening to ≥ 30 s reduces the
+    # bystander-permanently-shapes-the-map effect at the cost of slower
+    # adaptation to real new obstacles). Toggle off via the
+    # use_obstacle_tracker launch arg if it misbehaves on real grass.
     obstacle_tracker_node = Node(
         condition=IfCondition(LaunchConfiguration("use_obstacle_tracker")),
         package="mowgli_map",

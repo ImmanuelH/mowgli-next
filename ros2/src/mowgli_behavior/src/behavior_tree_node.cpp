@@ -35,6 +35,7 @@
 #include "mowgli_interfaces/srv/start_in_area.hpp"
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "nav2_msgs/action/undock_robot.hpp"
+#include "nav2_msgs/msg/collision_monitor_state.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "std_msgs/msg/bool.hpp"
@@ -181,6 +182,37 @@ private:
           context_->gps_x = msg->pose.pose.position.x;
           context_->gps_y = msg->pose.pose.position.y;
 
+          // Buffer GPS samples while the undock BackUp is in flight so
+          // CalibrateHeadingFromUndock can fit a line through the whole
+          // trajectory (much tighter yaw than the endpoint-only method).
+          // Drop samples that haven't moved at least 5 cm so a stalled
+          // chassis doesn't bloat the buffer; cap the buffer to
+          // kUndockGpsSamplesCap and drop the oldest on overflow.
+          if (context_->undock_start_recorded)
+          {
+            auto& buf = context_->undock_gps_samples;
+            const double x = context_->gps_x;
+            const double y = context_->gps_y;
+            bool keep = true;
+            if (!buf.empty())
+            {
+              const double dx = x - buf.back().first;
+              const double dy = y - buf.back().second;
+              if ((dx * dx + dy * dy) < (0.05 * 0.05))
+              {
+                keep = false;
+              }
+            }
+            if (keep)
+            {
+              if (buf.size() >= BTContext::kUndockGpsSamplesCap)
+              {
+                buf.erase(buf.begin());
+              }
+              buf.emplace_back(x, y);
+            }
+          }
+
           // Derive fix type from flags:
           //   FLAG_GPS_RTK_FIXED=2 → fix_type 4 (RTK fixed)
           //   FLAG_GPS_RTK_FLOAT=4 → fix_type 5 (RTK float)
@@ -206,6 +238,41 @@ private:
           // RTK fixed (fix_type >= 4) with reasonable accuracy → GPS is fixed.
           context_->gps_is_fixed = (context_->gps_fix_type >= 4) && (msg->position_accuracy < 0.1f);
           context_->gps_quality = std::clamp(1.0f - msg->position_accuracy, 0.0f, 1.0f);
+        });
+
+    // collision_monitor state — used by IsObstacleStuck to detect when
+    // the robot is wedged on an obstacle (PolygonStop active for ≥5 s).
+    // Latched into BTContext so the condition tick is a pure read.
+    collision_monitor_sub_ = create_subscription<nav2_msgs::msg::CollisionMonitorState>(
+        "/collision_monitor_state",
+        10,
+        [this](nav2_msgs::msg::CollisionMonitorState::ConstSharedPtr msg)
+        {
+          std::lock_guard<std::mutex> lock(context_->context_mutex);
+          const uint8_t prev = context_->collision_action_type;
+          context_->collision_action_type = msg->action_type;
+
+          // Stamp the entry-into-STOP transition so IsObstacleStuck can
+          // measure duration. On STOP exit, clear collision_stop_since AND
+          // record the exit time in last_collision_stop_end so
+          // WasRecentlyInCollisionStop can guard MarkBlockedAndSkip against
+          // marking cells DEAD just because a dynamic obstacle wedged the
+          // robot for a few seconds and then walked off.
+          if (msg->action_type == nav2_msgs::msg::CollisionMonitorState::STOP)
+          {
+            if (prev != nav2_msgs::msg::CollisionMonitorState::STOP)
+            {
+              context_->collision_stop_since = std::chrono::steady_clock::now();
+            }
+          }
+          else
+          {
+            if (prev == nav2_msgs::msg::CollisionMonitorState::STOP)
+            {
+              context_->last_collision_stop_end = std::chrono::steady_clock::now();
+            }
+            context_->collision_stop_since = std::chrono::steady_clock::time_point{};
+          }
         });
 
     RCLCPP_DEBUG(get_logger(), "Topic subscribers created");
@@ -349,6 +416,17 @@ private:
     blackboard_->set("dock_pose", dock_pose);
     blackboard_->set("undock_pose", undock_pose);
 
+    // Undock reverse speed, sourced from mowgli_robot.yaml.undock_speed
+    // and consumed by the BackUp BT instances in main_tree.xml via the
+    // {undock_speed} blackboard reference. Previously the speed was
+    // hardcoded as a string attribute in three undock-flow BackUps,
+    // which kept the yaml value orphan — editing the GUI slider did
+    // nothing. Recovery-side BackUps (e.g. OBSTACLE_BACKOFF) intentionally
+    // stay hardcoded; they are not "undocking" so they should not move
+    // when the operator tunes undock speed. See issue #191.
+    const double undock_speed = declare_parameter<double>("undock_speed", 0.15);
+    blackboard_->set("undock_speed", undock_speed);
+
     // Rain delay: parameter in minutes, blackboard in seconds.
     const double rain_delay_minutes = declare_parameter<double>("rain_delay_minutes", 30.0);
     blackboard_->set("rain_delay_sec", rain_delay_minutes * 60.0);
@@ -369,9 +447,17 @@ private:
 
     declare_parameter<double>("tick_rate", 10.0);
 
-    // Battery voltage curve — configurable via mowgli_robot.yaml
+    // Robot footprint — used by PlanCoverageArea to inset the perimeter
+    // ring path so the chassis (wider than the mower deck) stays inside
+    // the polygon. Default matches YardForce 500 (mowgli_robot.yaml).
+    declare_parameter<double>("chassis_width", 0.40);
+    declare_parameter<double>("chassis_length", 0.60);
+
+    // Battery voltage curve — configurable via mowgli_robot.yaml.
+    // YardForce500 SLA packs top out around 28.0 V on the dock; the previous
+    // default of 28.5 V capped the displayed percent at 88.9 % when full.
     battery_full_voltage_ =
-        static_cast<float>(declare_parameter<double>("battery_full_voltage", 28.5));
+        static_cast<float>(declare_parameter<double>("battery_full_voltage", 28.0));
     battery_empty_voltage_ =
         static_cast<float>(declare_parameter<double>("battery_empty_voltage", 24.0));
 
@@ -450,6 +536,7 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr boundary_violation_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr lethal_boundary_violation_sub_;
   rclcpp::Subscription<mowgli_interfaces::msg::AbsolutePose>::SharedPtr gps_sub_;
+  rclcpp::Subscription<nav2_msgs::msg::CollisionMonitorState>::SharedPtr collision_monitor_sub_;
 
   // Service server
   rclcpp::Service<mowgli_interfaces::srv::HighLevelControl>::SharedPtr high_level_control_srv_;
@@ -473,7 +560,7 @@ private:
   bool undock_ready_{false};
 
   // Battery voltage curve parameters
-  float battery_full_voltage_{28.5f};
+  float battery_full_voltage_{28.0f};
   float battery_empty_voltage_{24.0f};
 };
 

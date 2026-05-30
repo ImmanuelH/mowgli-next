@@ -78,11 +78,11 @@
           "default": 0.36,
           "description": "Centre-to-centre distance between front casters in metres."
         },
-        "ticks_per_revolution": {
+        "ticks_per_meter": {
           "type": "integer",
-          "title": "Encoder Ticks per Revolution",
+          "title": "Encoder Ticks per Meter",
           "default": 1050,
-          "description": "Encoder ticks per full wheel revolution."
+          "description": "Encoder ticks per metre of wheel travel."
         },
         "tool_width": {
           "type": "number",
@@ -143,7 +143,7 @@
           "type": "boolean",
           "title": "Enable LiDAR",
           "default": true,
-          "description": "Enable LiDAR and fusion_graph scan-matching (when use_fusion_graph is on). Disable for non-LiDAR builds."
+          "description": "Enable LiDAR. Scan-matching and loop-closure factors in fusion_graph_node are opt-in (use_scan_matching, use_loop_closure). Disable for non-LiDAR builds."
         },
         "lidar_x": {
           "type": "number",
@@ -173,7 +173,7 @@
           "type": "number",
           "title": "GPS Antenna Offset X",
           "default": 0.3,
-          "description": "Body-frame forward offset of GPS antenna from base_footprint (metres). Used by navsat_transform (robot_localization) for lever-arm correction."
+          "description": "Body-frame forward offset of GPS antenna from base_footprint (metres). Used by fusion_graph_node's GnssLeverArmFactor to subtract the antenna lever-arm from each /gps/fix sample."
         },
         "gps_y": {
           "type": "number",
@@ -208,7 +208,7 @@
         "datum_alt": {
           "type": "number",
           "title": "Datum Altitude",
-          "description": "Map origin altitude (WGS84 ellipsoidal, metres) — site-specific; no default. Used by navsat_transform (robot_localization) as the altitude reference."
+          "description": "Map origin altitude (WGS84 ellipsoidal, metres) — site-specific; no default. Used as the altitude reference when converting GPS fixes to the local map frame."
         },
         "gps_protocol": {
           "type": "string",
@@ -297,6 +297,12 @@
           "default": 1.0,
           "description": "Staging point distance in front of dock (metres)."
         },
+        "dock_approach_overshoot": {
+          "type": "number",
+          "title": "Dock Approach Overshoot",
+          "default": 0.05,
+          "description": "Forward overshoot (metres) applied to the dock target along its yaw axis. opennav_docking drives toward dock_pose + overshoot * forward and stops at docking_threshold, putting firm contact on the cradle. 0 disables the shift."
+        },
         "dock_max_retries": {
           "type": "integer",
           "title": "Dock Max Retries",
@@ -308,6 +314,12 @@
           "title": "Use Charger Detection",
           "default": true,
           "description": "Detect charging voltage to confirm successful dock."
+        },
+        "dock_charging_threshold": {
+          "type": "number",
+          "title": "Charging Threshold",
+          "default": 0.3,
+          "description": "Battery current (A) at which SimpleChargingDock considers the cradle reached. Higher = more forward press into the contacts before stopping; lower = stops sooner. 0.3 A is a stable seat on the YardForce charger."
         }
       }
     },
@@ -363,6 +375,18 @@
           "default": 0.18,
           "description": "Width of headland (turning area) in metres."
         },
+        "num_headland_passes": {
+          "type": "integer",
+          "title": "Headland Passes",
+          "default": 0,
+          "description": "Number of concentric perimeter rings before the inner field. 0 = auto (ceil(headland_width / tool_width)); >0 forces exactly that count."
+        },
+        "chassis_safety_inset": {
+          "type": "number",
+          "title": "Chassis Safety Inset",
+          "default": 0.20,
+          "description": "Pre-shrink the operator polygon by this many metres before F2C plans anything. Defaults to chassis_width / 2 so the chassis edge stays inside the polygon under perfect FTC tracking."
+        },
         "min_turning_radius": {
           "type": "number",
           "title": "Min Turning Radius",
@@ -390,8 +414,8 @@
         "battery_full_voltage": {
           "type": "number",
           "title": "Full Voltage",
-          "default": 28.5,
-          "description": "Voltage at which battery is considered full."
+          "default": 28.0,
+          "description": "Voltage at which battery is considered full. Default 28.0 matches YardForce500 SLA packs on the dock; raise if your pack genuinely reaches a higher resting voltage."
         },
         "battery_empty_voltage": {
           "type": "number",
@@ -441,18 +465,6 @@
           "default": 40.0,
           "description": "Resume blade below this motor temperature (C)."
         },
-        "emergency_stop_on_tilt": {
-          "type": "boolean",
-          "title": "Emergency Stop on Tilt",
-          "default": true,
-          "description": "Emergency stop when robot tilts beyond threshold."
-        },
-        "emergency_stop_on_lift": {
-          "type": "boolean",
-          "title": "Emergency Stop on Lift",
-          "default": true,
-          "description": "Emergency stop when robot is lifted."
-        },
         "max_obstacle_avoidance_distance": {
           "type": "number",
           "title": "Max Obstacle Detour",
@@ -482,7 +494,7 @@
           "title": "SLAM Mode",
           "enum": ["lifelong", "mapping", "localization"],
           "default": "lifelong",
-          "description": "Legacy SLAM toolbox operating mode. Unused — robot_localization (dual-EKF) is the primary localizer and there is no SLAM backend. Kept for config backward compatibility."
+          "description": "Legacy SLAM toolbox operating mode. Unused — fusion_graph_node (GTSAM iSAM2) is the primary localizer and slam_toolbox is no longer part of the stack. Kept for config backward compatibility."
         },
         "map_save_on_dock": {
           "type": "boolean",

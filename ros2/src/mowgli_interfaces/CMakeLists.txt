@@ -20,6 +20,7 @@ set(msg_files
   "msg/Power.msg"
   "msg/ESCStatus.msg"
   "msg/HighLevelStatus.msg"
+  "msg/GnssStatus.msg"
   "msg/AbsolutePose.msg"
   "msg/WheelTick.msg"
   "msg/ImuRaw.msg"
@@ -40,11 +41,15 @@ set(srv_files
   "srv/SetDockingPoint.srv"
   "srv/TriggerReplan.srv"
   "srv/GetNextStrip.srv"
+  "srv/GetNextSegment.srv"
+  "srv/MarkSegmentBlocked.srv"
   "srv/GetCoverageStatus.srv"
+  "srv/GetRemainingAreaPolygon.srv"
   "srv/AreaRecording.srv"
   "srv/CalibrateImuYaw.srv"
   "srv/GetRecoveryPoint.srv"
   "srv/StartInArea.srv"
+  "srv/PromoteObstacle.srv"
 )
 
 # Declare action files

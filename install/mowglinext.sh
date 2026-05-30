@@ -5,6 +5,11 @@
 
 set -euo pipefail
 
+# Preserve the original argv so sync_repo_branch_to_image_channel can re-exec
+# us with the same flags after switching the git checkout to the requested
+# channel. Must be captured before parse_args() consumes anything.
+MOWGLI_INSTALLER_ARGV=("$@")
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_LIB_DIR="${SCRIPT_DIR}/lib"
 
@@ -22,6 +27,9 @@ source "${INSTALL_LIB_DIR}/backend_choice.sh"
 source "${INSTALL_LIB_DIR}/udev.sh"
 source "${INSTALL_LIB_DIR}/deploy.sh"
 source "${INSTALL_LIB_DIR}/env.sh"
+source "${INSTALL_LIB_DIR}/serial_probe.sh"
+source "${INSTALL_LIB_DIR}/unicore_config.sh"
+source "${INSTALL_LIB_DIR}/ublox_config.sh"
 source "${INSTALL_LIB_DIR}/gps.sh"
 source "${INSTALL_LIB_DIR}/lidar.sh"
 source "${INSTALL_LIB_DIR}/range.sh"
@@ -50,6 +58,34 @@ load_preset() {
   fi
 }
 
+load_install_state() {
+  local preset_file
+  local preset_attempted=false
+
+  preset_file="$(preset_file_path)"
+
+  if ! $CHECK_ONLY && [ -f "$preset_file" ]; then
+    preset_attempted=true
+    load_preset
+
+    if [ "${PRESET_LOADED:-false}" = "true" ] && [ -n "${STATE_ACTIVE_PRESET_FILE:-}" ]; then
+      if [ -f "$REPO_DIR/docker/.env" ]; then
+        warn "Web preset detected; existing docker/.env will be backed up and ignored for this install run."
+        backup_env_defaults_file "$REPO_DIR/docker/.env"
+      fi
+      return 0
+    fi
+  fi
+
+  if [ -f "$REPO_DIR/docker/.env" ]; then
+    load_env_defaults_file "$REPO_DIR/docker/.env"
+  fi
+
+  if ! $CHECK_ONLY && [ "$preset_attempted" != "true" ]; then
+    load_preset
+  fi
+}
+
 main() {
   show_banner
   load_locale
@@ -57,21 +93,28 @@ main() {
   assert_supported_platform || return 1
   print_platform_summary
 
-  if [ -f "$REPO_DIR/docker/.env" ]; then
-    load_env_defaults_file "$REPO_DIR/docker/.env"
-  fi
-
   if ! $CHECK_ONLY; then
     local TOTAL_STEPS=15
 
-    # Language selection, load previous env, then load preset
+    # Language selection, load previous env unless a web preset intentionally
+    # starts a fresh runtime configuration.
     select_language
+    load_install_state
 
     # Image refs are tied to the install script version — never inherit
     # stale paths from older installs (e.g. mowgli-docker, openmower-gui).
     unset MOWGLI_ROS2_IMAGE GPS_IMAGE UNICORE_IMAGE LIDAR_IMAGE MAVROS_IMAGE NMEA_IMAGE GUI_IMAGE
 
-    load_preset
+    # Image channel selection (main = stable, dev = iteration). Uses the
+    # previous IMAGE_TAG from .env as the default. Skipped if a preset or
+    # --branch= flag already set it.
+    select_image_channel
+
+    # If IMAGE_TAG ended up different from the current git branch (e.g. the
+    # bootstrap cloned :main but the user picked dev), check out the matching
+    # branch and re-exec so the rest of the install reads the new branch's
+    # compose files, scripts, and lib code.
+    sync_repo_branch_to_image_channel
 
     progress_run_interactive 1 "$TOTAL_STEPS" "Updating system" \
       run_system_update
@@ -119,6 +162,8 @@ main() {
       run_startup_step_live
 
   else
+    load_install_state
+
     if [ ! -f "$INSTALL_DIR/compose/docker-compose.base.yml" ]; then
       error "No installation sources found at $INSTALL_DIR — run without --check first"
       return 1
@@ -136,6 +181,7 @@ main() {
   echo -e "${CYAN}${BOLD}══ System Health Check ══${NC}"
 
   check_devices
+  check_generated_gps_yaml_alignment
   check_containers
   check_firmware
   check_gps
