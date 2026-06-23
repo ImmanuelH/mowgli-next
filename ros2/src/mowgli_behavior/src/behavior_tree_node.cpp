@@ -213,18 +213,23 @@ private:
             }
           }
 
-          // Derive fix type from flags:
-          //   FLAG_GPS_RTK_FIXED=2 → fix_type 4 (RTK fixed)
-          //   FLAG_GPS_RTK_FLOAT=4 → fix_type 5 (RTK float)
-          //   FLAG_GPS_RTK=1       → fix_type 2 (DGPS/RTK)
-          //   otherwise            → fix_type 0 (no fix / autonomous)
+          // Derive fix type from flags. The ordinal MUST be monotonic in
+          // quality (higher = better) because the undock/preflight gates use
+          // ">= min_fix_type". RTK-Fixed is the best fix, so it must be the
+          // highest value — earlier code ranked Float (5) ABOVE Fixed (4),
+          // which let a robot in RTK-Float pass a "require RTK-Fixed" (min=4)
+          // gate and undock/mow on Float-quality GPS (σ 10-50 cm). Ordering:
+          //   FLAG_GPS_RTK_FIXED → 4 (RTK fixed — best)
+          //   FLAG_GPS_RTK_FLOAT → 3 (RTK float — worse than fixed)
+          //   FLAG_GPS_RTK       → 2 (DGPS/RTK)
+          //   otherwise          → 0 (no fix / autonomous)
           if (msg->flags & AP::FLAG_GPS_RTK_FIXED)
           {
             context_->gps_fix_type = 4;
           }
           else if (msg->flags & AP::FLAG_GPS_RTK_FLOAT)
           {
-            context_->gps_fix_type = 5;
+            context_->gps_fix_type = 3;
           }
           else if (msg->flags & AP::FLAG_GPS_RTK)
           {
@@ -426,6 +431,15 @@ private:
     // when the operator tunes undock speed. See issue #191.
     const double undock_speed = declare_parameter<double>("undock_speed", 0.15);
     blackboard_->set("undock_speed", undock_speed);
+
+    // Transit / mowing speeds, sourced from mowgli_robot.yaml and applied to
+    // the live controllers by SetNavMode (FollowPath.desired_linear_vel for the
+    // RPP transit controller, FollowCoveragePath.speed_fast for FTC coverage).
+    // Stored on the shared BTContext so SetNavMode's tick is a pure read.
+    // Previously SetNavMode hardcoded 0.5 (precise) / 0.25 (degraded), which
+    // stomped the launch-injected values — the configured speeds never applied.
+    context_->transit_speed = declare_parameter<double>("transit_speed", 0.25);
+    context_->mowing_speed = declare_parameter<double>("mowing_speed", 0.2);
 
     // Rain delay: parameter in minutes, blackboard in seconds.
     const double rain_delay_minutes = declare_parameter<double>("rain_delay_minutes", 30.0);
