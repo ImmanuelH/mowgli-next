@@ -1884,6 +1884,17 @@
         "placeholder": "e.g. 3 6",
         "helpText": "MowgliNext normalizes this to 'master slave' on save. Universal GNSS accepts any syntactically valid 0..9 pair, then warns when the combination is advanced and not one of the recommended documented presets."
       },
+      "roverDynamicMode": {
+        "label": "Rover Dynamic Mode",
+        "tooltip": "Motion model the receiver assumes for RTK. UAV is the kinematic engine that fixes fast and holds lock while the mower moves; Survey Mow is tuned for near-static surveying (slower to fix, can drop lock under motion); Rover is the generic fallback.",
+        "helpText": "Auto uses the per-model default (UM980 defaults to UAV). Choose UAV if your receiver is slow to reach RTK-Fixed or loses fix while mowing.",
+        "option": {
+          "auto": { "label": "Auto (per-model default)" },
+          "uav": { "label": "UAV (kinematic — recommended)" },
+          "survey_mow": { "label": "Survey Mow" },
+          "rover": { "label": "Rover (generic)" }
+        }
+      },
       "pvtAlgorithm": {
         "label": "PVT Algorithm",
         "tooltip": "Optional Unicore-specific PVT algorithm override that the future backend translator can map to vendor commands.",

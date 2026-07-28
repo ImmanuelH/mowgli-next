@@ -72,6 +72,26 @@ describe("gnssConfig", () => {
         expect(signalGroupField?.key).toBe("gnss_signal_group");
     });
 
+    it("exposes the rover dynamic-mode dropdown (Auto/UAV/Survey Mow/Rover, issue #395)", () => {
+        expect(GNSS_ACTION_SETTINGS_KEYS).toContain("gnss_rover_dynamic_mode");
+        const roverModeField = GNSS_ADVANCED_SETTINGS_BY_FAMILY.unicore?.fields.find(
+            (field) => field.key === "gnss_rover_dynamic_mode",
+        );
+        expect(roverModeField?.kind).toBe("select");
+        if (roverModeField?.kind !== "select") {
+            throw new Error("expected select field");
+        }
+        expect(roverModeField.options.map((option) => option.value)).toEqual([
+            "",
+            "uav",
+            "survey_mow",
+            "rover",
+        ]);
+        expect(i18n.t(roverModeField.options[1].label)).toBe(
+            en.gnssConfig.unicore.roverDynamicMode.option.uav.label,
+        );
+    });
+
     it("persists an optional execution-baud override separately from runtime/config baud", () => {
         expect(GNSS_ACTION_SETTINGS_KEYS).toContain("gnss_execution_baud");
         expect(GNSS_EXECUTION_BAUD_OPTIONS.map((option) => option.value)).toEqual([

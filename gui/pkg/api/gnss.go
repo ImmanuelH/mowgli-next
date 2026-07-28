@@ -50,9 +50,10 @@ type gnssSavedConfig struct {
 	ExecutionBaud  string
 	Profile        string
 	SignalProfile  string
-	SignalGroup    string
-	ReceiverModel  string
-	ProfileRateHz  string
+	SignalGroup      string
+	ReceiverModel    string
+	RoverDynamicMode string
+	ProfileRateHz    string
 }
 
 type GNSSCommandExecution struct {
@@ -507,6 +508,9 @@ func buildGNSSPlanCommand(cfg gnssSavedConfig) []string {
 	if shouldPassGNSSSignalGroup(cfg) {
 		command = append(command, "--signal-group", cfg.SignalGroup)
 	}
+	if shouldPassGNSSRoverDynamicMode(cfg) {
+		command = append(command, "--rover-dynamic-mode", cfg.RoverDynamicMode)
+	}
 	command = append(command, cfg.ReceiverFamily, cfg.Profile)
 	return command
 }
@@ -549,12 +553,22 @@ func buildGNSSApplyCommand(cfg gnssSavedConfig, profile string) []string {
 	if shouldPassGNSSSignalGroup(cfg) {
 		command = append(command, "--signal-group", cfg.SignalGroup)
 	}
+	if shouldPassGNSSRoverDynamicMode(cfg) {
+		command = append(command, "--rover-dynamic-mode", cfg.RoverDynamicMode)
+	}
 
 	return command
 }
 
 func shouldPassGNSSSignalGroup(cfg gnssSavedConfig) bool {
 	return cfg.ReceiverFamily == "unicore" && strings.TrimSpace(cfg.SignalGroup) != ""
+}
+
+// shouldPassGNSSRoverDynamicMode passes an explicit rover dynamic-mode override
+// only for Unicore and only when set. Empty means "auto" — let the receiver
+// profile pick its per-model default (UM980 -> MODE ROVER UAV, issue #395).
+func shouldPassGNSSRoverDynamicMode(cfg gnssSavedConfig) bool {
+	return cfg.ReceiverFamily == "unicore" && strings.TrimSpace(cfg.RoverDynamicMode) != ""
 }
 
 func buildGNSSProbeBaudCandidates(cfg gnssSavedConfig) []string {
@@ -667,9 +681,10 @@ func loadSavedGNSSConfig(dbProvider pkgtypes.IDBProvider) (gnssSavedConfig, erro
 		ExecutionBaud:  executionBaud,
 		Profile:        profile,
 		SignalProfile:  normalizeGnssSignalProfile(doc.Flat["gnss_signal_profile"], "balanced"),
-		SignalGroup:    signalGroup,
-		ReceiverModel:  normalizeGnssReceiverModel(doc.Flat["gnss_receiver_model"]),
-		ProfileRateHz:  rateHz,
+		SignalGroup:      signalGroup,
+		ReceiverModel:    normalizeGnssReceiverModel(doc.Flat["gnss_receiver_model"]),
+		RoverDynamicMode: normalizeGnssRoverDynamicMode(doc.Flat["gnss_rover_dynamic_mode"]),
+		ProfileRateHz:    rateHz,
 	}, nil
 }
 

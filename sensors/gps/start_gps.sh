@@ -359,6 +359,22 @@ resolve_signal_group() {
   printf '%s\n' "${GNSS_SIGNAL_GROUP:-}"
 }
 
+# Rover dynamic-motion model (issue #395). Empty = let the receiver profile pick
+# its per-model default (UM980 -> MODE ROVER UAV, other mower models -> SURVEY
+# MOW). Set to uav|survey_mow|rover to override. Deliberately NOT defaulted to a
+# concrete value here so the UM980-only default flip stays owned by the profile
+# builder rather than being forced onto every model.
+resolve_rover_dynamic_mode() {
+  local yaml_rover_dynamic_mode
+  yaml_rover_dynamic_mode="$(parse_yaml_any gnss_rover_dynamic_mode)"
+  if [ -n "$yaml_rover_dynamic_mode" ]; then
+    printf '%s\n' "$yaml_rover_dynamic_mode"
+    return 0
+  fi
+
+  printf '%s\n' "${GNSS_ROVER_DYNAMIC_MODE:-}"
+}
+
 print_command() {
   local label="$1"
   shift
@@ -438,6 +454,7 @@ config_profile="$(resolve_config_profile)"
 signal_profile="$(resolve_signal_profile)"
 receiver_model="$(resolve_receiver_model)"
 signal_group="$(resolve_signal_group)"
+rover_dynamic_mode="$(resolve_rover_dynamic_mode)"
 
 if [ "$transport" = "serial" ] && [ ! -e "$serial_device" ]; then
   echo "[start_gps.sh] ERROR: selected GNSS serial device does not exist: ${serial_device}"
@@ -468,6 +485,9 @@ if [ -n "$receiver_model" ]; then
 fi
 if [ -n "$signal_group" ]; then
   config_apply_cmd+=(--signal-group "$signal_group")
+fi
+if [ -n "$rover_dynamic_mode" ]; then
+  config_apply_cmd+=(--rover-dynamic-mode "$rover_dynamic_mode")
 fi
 
 # Apply the receiver profile synchronously (serial transport only). A failure is
