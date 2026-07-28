@@ -19,7 +19,7 @@ const { Text, Paragraph } = Typography;
  */
 export const DockCalibrationCard: React.FC = () => {
     const { colors } = useThemeMode();
-    const { status, start, starting, running, done } = useDockCalibration();
+    const { status, start, starting, startError, running, done } = useDockCalibration();
 
     const phase = status?.phase ?? 6;
     const progressPct = Math.round((status?.progress ?? 0) * 100);
@@ -51,6 +51,15 @@ export const DockCalibrationCard: React.FC = () => {
                 >
                     {running ? "Calibrating…" : "Start dock calibration"}
                 </Button>
+
+                {startError && !running && (
+                    <Alert
+                        type="error"
+                        showIcon
+                        message="Could not start dock calibration"
+                        description={startError}
+                    />
+                )}
 
                 {(running || (status && status.phase !== 6)) && !showResult && (
                     <div>
