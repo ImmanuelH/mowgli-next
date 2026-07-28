@@ -172,9 +172,10 @@ TEST(ScanMatcher, MinInliersOverrideGatesAcceptance)
   auto tgt = SyntheticScan(200, T_truth);
 
   fusion_graph::ScanMatcher matcher;
-  EXPECT_TRUE(matcher.Match(src, tgt, gtsam::Pose2()).ok);            // default (30)
-  EXPECT_TRUE(matcher.Match(src, tgt, gtsam::Pose2(), 16).ok);        // looser override accepts
-  EXPECT_FALSE(matcher.Match(src, tgt, gtsam::Pose2(), 100000).ok);   // impossibly-high override rejects
+  EXPECT_TRUE(matcher.Match(src, tgt, gtsam::Pose2()).ok);  // default (30)
+  EXPECT_TRUE(matcher.Match(src, tgt, gtsam::Pose2(), 16).ok);  // looser override accepts
+  EXPECT_FALSE(
+      matcher.Match(src, tgt, gtsam::Pose2(), 100000).ok);  // impossibly-high override rejects
 }
 
 TEST(ScanMatcher, EmptyInputsFail)
