@@ -1880,6 +1880,17 @@
         "placeholder": "ex. 3 6",
         "helpText": "MowgliNext normalise cette valeur en 'master slave' à l'enregistrement. Universal GNSS accepte toute paire 0..9 valide par syntaxe, puis émet un avertissement quand la combinaison est avancée et ne fait pas partie des presets documentés recommandés."
       },
+      "roverDynamicMode": {
+        "label": "Mode dynamique du rover",
+        "tooltip": "Modèle de mouvement que le récepteur suppose pour le RTK. UAV est le moteur cinématique qui fixe rapidement et conserve le verrouillage pendant que la tondeuse se déplace ; Survey Mow est optimisé pour un relevé quasi statique (plus lent à fixer, peut perdre le verrouillage en mouvement) ; Rover est le repli générique.",
+        "helpText": "Auto utilise la valeur par défaut selon le modèle (le UM980 utilise UAV par défaut). Choisissez UAV si votre récepteur est lent à atteindre le RTK-Fixe ou perd le fix pendant la tonte.",
+        "option": {
+          "auto": { "label": "Auto (défaut selon le modèle)" },
+          "uav": { "label": "UAV (cinématique — recommandé)" },
+          "survey_mow": { "label": "Survey Mow" },
+          "rover": { "label": "Rover (générique)" }
+        }
+      },
       "pvtAlgorithm": {
         "label": "Algorithme PVT",
         "tooltip": "Surcharge facultative de l'algorithme PVT spécifique à Unicore que le futur traducteur backend pourra associer aux commandes du fabricant.",

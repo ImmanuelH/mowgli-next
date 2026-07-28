@@ -335,6 +335,12 @@
           "title": "Raw Signal Group",
           "description": "Vendor-specific expert override. Accepts 'master slave', 'master,slave', or 'master/slave' and is normalized on save; advanced Unicore combinations are allowed with warnings instead of a hard allowlist."
         },
+        "gnss_rover_dynamic_mode": {
+          "type": "string",
+          "enum": ["", "uav", "survey_mow", "rover"],
+          "title": "Rover Dynamic Mode",
+          "description": "Unicore rover motion model for RTK. Empty = auto (per-model default; UM980 defaults to uav). uav is the kinematic engine (fast fix, holds lock while moving); survey_mow is the near-static survey engine; rover is the generic fallback."
+        },
         "gnss_unicore_pvt_algorithm": {
           "type": "string",
           "title": "Unicore PVT Algorithm",
