@@ -579,6 +579,20 @@ func normalizeGnssReceiverModel(value any) string {
 	}
 }
 
+// normalizeGnssRoverDynamicMode canonicalizes the Unicore rover dynamic-motion
+// selector (issue #395). Empty (or an unrecognized value) means "auto" — leave
+// the receiver profile's per-model default in place (UM980 -> uav).
+func normalizeGnssRoverDynamicMode(value any) string {
+	switch mode := strings.ToLower(strings.TrimSpace(stringValue(value, ""))); mode {
+	case "uav", "survey_mow", "rover":
+		return mode
+	case "survey-mow":
+		return "survey_mow"
+	default:
+		return ""
+	}
+}
+
 func normalizeGnssProfileRate(value any, defaultValue string) string {
 	switch stringValue(value, defaultValue) {
 	case "1", "5", "7", "10":

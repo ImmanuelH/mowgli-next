@@ -248,6 +248,8 @@ collision_monitor:
       # Chassis + 15 cm — slow to 70% when obstacle is close
       points: "[[0.65, 0.35], [0.65, -0.35], [-0.25, -0.35], [-0.25, 0.35]]"
       action_type: "slowdown"
+      # 2026-07-23 field-validated default (was 0.5); kept in lockstep with the
+      # template obstacle_slowdown_ratio, which navigation.launch.py injects here.
       slowdown_ratio: 0.7
       # 12 points: the dock structure sits near the polygon boundary
       # when charging, causing rapid slow/normal flapping at 10 Hz.

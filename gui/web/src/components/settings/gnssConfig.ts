@@ -61,6 +61,13 @@ export const GNSS_SIGNAL_PROFILE_HELP_TEXT =
 export const GNSS_SIGNAL_PROFILE_CUSTOM_HELP_TEXT =
     "gnssConfig.signalProfileCustomHelpText";
 
+export const GNSS_ROVER_DYNAMIC_MODE_OPTIONS = [
+    { value: "", label: "gnssConfig.unicore.roverDynamicMode.option.auto.label" },
+    { value: "uav", label: "gnssConfig.unicore.roverDynamicMode.option.uav.label" },
+    { value: "survey_mow", label: "gnssConfig.unicore.roverDynamicMode.option.survey_mow.label" },
+    { value: "rover", label: "gnssConfig.unicore.roverDynamicMode.option.rover.label" },
+] as const;
+
 export const GNSS_PROFILE_RATE_OPTIONS = [
     { value: 1, label: "1 Hz" },
     { value: 5, label: "5 Hz" },
@@ -79,6 +86,7 @@ export const GNSS_ACTION_SETTINGS_KEYS = [
     "gnss_signal_profile",
     "gnss_profile_rate_hz",
     "gnss_signal_group",
+    "gnss_rover_dynamic_mode",
     "gnss_unicore_pvt_algorithm",
     "gnss_unicore_rtk_reliability",
     "gnss_unicore_rtk_timeout_s",
@@ -189,6 +197,14 @@ export const GNSS_ADVANCED_SETTINGS_BY_FAMILY: Record<string, GnssReceiverAdvanc
                 tooltip: "gnssConfig.unicore.signalGroup.tooltip",
                 placeholder: "gnssConfig.unicore.signalGroup.placeholder",
                 helpText: "gnssConfig.unicore.signalGroup.helpText",
+            },
+            {
+                kind: "select",
+                key: "gnss_rover_dynamic_mode",
+                label: "gnssConfig.unicore.roverDynamicMode.label",
+                tooltip: "gnssConfig.unicore.roverDynamicMode.tooltip",
+                options: GNSS_ROVER_DYNAMIC_MODE_OPTIONS,
+                helpText: "gnssConfig.unicore.roverDynamicMode.helpText",
             },
             {
                 kind: "text",
