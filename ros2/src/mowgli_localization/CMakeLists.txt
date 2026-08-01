@@ -18,8 +18,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ---------------------------------------------------------------------------
 
 find_package(ament_cmake        REQUIRED)
-find_package(diagnostic_msgs    REQUIRED)
 find_package(rclcpp             REQUIRED)
+find_package(rclcpp_action      REQUIRED)
 find_package(nav_msgs           REQUIRED)
 find_package(geometry_msgs      REQUIRED)
 find_package(sensor_msgs        REQUIRED)
@@ -65,15 +65,12 @@ ament_target_dependencies(wheel_odometry_node
 # ---------------------------------------------------------------------------
 
 add_executable(navsat_to_absolute_pose_node
-  src/gnss_runtime_state_builder.cpp
-  src/gnss_status_adapter.cpp
   src/navsat_to_absolute_pose_node.cpp
 )
 
 target_include_directories(navsat_to_absolute_pose_node PUBLIC ${INCLUDE_DIR})
 
 ament_target_dependencies(navsat_to_absolute_pose_node
-  diagnostic_msgs
   rclcpp
   sensor_msgs
   geometry_msgs
@@ -149,11 +146,15 @@ add_executable(calibrate_imu_yaw_node
   src/calibrate_imu_yaw_node.cpp
 )
 
+target_include_directories(calibrate_imu_yaw_node PUBLIC ${INCLUDE_DIR})
+
 ament_target_dependencies(calibrate_imu_yaw_node
   rclcpp
+  rclcpp_action
   geometry_msgs
   sensor_msgs
   nav_msgs
+  std_srvs
   mowgli_interfaces
 )
 
@@ -189,6 +190,31 @@ add_executable(scan_deskew_node
 ament_target_dependencies(scan_deskew_node
   rclcpp
   sensor_msgs
+  nav_msgs
+)
+
+# ---------------------------------------------------------------------------
+# Executable: gps_dock_detection_node — publishes a GPS-derived dock detection
+# (PoseStamped on detected_dock_pose, in the odom fixed_frame) so
+# opennav_docking can approach the cradle off RTK-Fixed GPS instead of the
+# corruptible map→odom factor-graph TF. See the source header for the full
+# data flow + RTK-Float fallback rationale.
+# ---------------------------------------------------------------------------
+
+add_executable(gps_dock_detection_node
+  src/gps_dock_detection_node.cpp
+)
+
+target_include_directories(gps_dock_detection_node PUBLIC ${INCLUDE_DIR})
+
+ament_target_dependencies(gps_dock_detection_node
+  rclcpp
+  geometry_msgs
+  sensor_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+  mowgli_interfaces
 )
 
 # ---------------------------------------------------------------------------
@@ -210,6 +236,7 @@ install(
     calibrate_imu_yaw_node
     costmap_scan_filter_node
     scan_deskew_node
+    gps_dock_detection_node
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
@@ -271,30 +298,54 @@ if(BUILD_TESTING)
     sensor_msgs
   )
 
-  ament_add_gtest(test_gnss_status_adapter
-    test/test_gnss_status_adapter.cpp
-    src/gnss_status_adapter.cpp
+  ament_add_gtest(test_navsat_projection_utils
+    test/test_navsat_projection_utils.cpp
   )
-  ament_target_dependencies(test_gnss_status_adapter
-    rclcpp
+  target_include_directories(test_navsat_projection_utils PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  ament_target_dependencies(test_navsat_projection_utils
     mowgli_interfaces
+    sensor_msgs
   )
-  target_include_directories(test_gnss_status_adapter PRIVATE
+
+  # ---- test_dock_cog_gate ----
+  # Pure C++ test of the one-click dock-calibration COG-coherence gate
+  # (dock_cog_gate.hpp): Resolution A — dock_yaw = circular_mean of the
+  # /imu/cog_heading body-heading samples (NO +pi), cross-checked against the
+  # reversed GPS travel bearing. No ROS2 deps, link gtest.
+  ament_add_gtest(test_dock_cog_gate
+    test/test_dock_cog_gate.cpp
+  )
+  target_include_directories(test_dock_cog_gate PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
 
-  ament_add_gtest(test_gnss_runtime_state_builder
-    test/test_gnss_runtime_state_builder.cpp
-    src/gnss_runtime_state_builder.cpp
+  # ---- test_delta_gate ----
+  # Pure C++ test of the map→odom yaw (Δ) stabilisation gate used by
+  # gps_dock_detection (delta_gate.hpp): jump-reject + EMA, and the issue #390
+  # stale-latch recovery (a sustained mutually-consistent rejection re-seeds Δ;
+  # a flapping transient never does). No ROS2 deps, link gtest.
+  ament_add_gtest(test_delta_gate
+    test/test_delta_gate.cpp
   )
-  ament_target_dependencies(test_gnss_runtime_state_builder
-    diagnostic_msgs
-    rclcpp
-    sensor_msgs
-  )
-  target_include_directories(test_gnss_runtime_state_builder PRIVATE
+  target_include_directories(test_delta_gate PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
+
+  # ---- test_robot_yaml_scalar ----
+  # Guards the ONE canonical dock_pose persist path (Invariant 6): the
+  # motion-derived (yaw_source=MOTION) write must splice only the dock_pose_*
+  # values, preserve every comment (Invariant 15 sparse config), skip the
+  # dock_pose_yaw_sigma_rad lookalike key, and write atomically once. The
+  # header lives in mowgli_interfaces; this package already depends on it.
+  ament_add_gtest(test_robot_yaml_scalar
+    test/test_robot_yaml_scalar.cpp
+  )
+  ament_target_dependencies(test_robot_yaml_scalar
+    mowgli_interfaces
+  )
+
 endif()
 
 # ---------------------------------------------------------------------------
@@ -304,7 +355,6 @@ endif()
 ament_export_include_directories(include)
 ament_export_dependencies(
   rclcpp
-  diagnostic_msgs
   nav_msgs
   geometry_msgs
   sensor_msgs

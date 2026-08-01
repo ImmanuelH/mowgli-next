@@ -22,6 +22,7 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(map_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(grid_map_core REQUIRED)
 find_package(grid_map_ros REQUIRED)
@@ -43,10 +44,8 @@ find_package(Boost REQUIRED)
 add_library(mowgli_map_lib STATIC
   src/map_server_node.cpp
   src/area_manager.cpp
-  src/coverage_planner.cpp
   src/costmap_filters.cpp
   src/progress_tracker.cpp
-  src/remaining_polygon.cpp
 )
 
 target_include_directories(mowgli_map_lib PUBLIC
@@ -88,6 +87,7 @@ ament_target_dependencies(mowgli_obstacle_tracker_lib
   rclcpp
   std_srvs
   nav_msgs
+  map_msgs
   geometry_msgs
   sensor_msgs
   visualization_msgs
@@ -199,12 +199,22 @@ if(BUILD_TESTING)
     rclcpp
     std_srvs
     nav_msgs
+    map_msgs
     geometry_msgs
     sensor_msgs
     visualization_msgs
     mowgli_interfaces
     tf2_ros
     tf2_geometry_msgs
+  )
+
+  # Pure logic, no ROS deps — mirrors fusion_graph's header-only gate tests.
+  ament_add_gtest(test_boundary_classifier
+    test/test_boundary_classifier.cpp
+  )
+  target_include_directories(test_boundary_classifier PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${Boost_INCLUDE_DIRS}
   )
 endif()
 
@@ -218,6 +228,7 @@ ament_export_dependencies(
   rclcpp
   std_srvs
   nav_msgs
+  map_msgs
   geometry_msgs
   grid_map_core
   grid_map_ros

@@ -36,15 +36,68 @@ mowgli:
     chassis_center_x: 0.18    # chassis geometric centre forward of wheel axis (m)
                                # with chassis_length 0.60 → rear bumper -0.12,
                                # front bumper +0.48
-    # ticks_per_meter is consumed by hardware_bridge_node to convert raw
-    # encoder tick deltas (from the STM32 firmware odom packet) into
-    # metres. MUST match the firmware constant TICKS_PER_M in
-    # firmware/stm32/ros_usbnode/include/board.h — the firmware sends
-    # raw ticks, the bridge does the scaling.
-    ticks_per_meter: 300.0
+    # ticks_per_meter is the runtime encoder scale consumed by
+    # hardware_bridge_node and pushed down to the STM32 firmware after the
+    # host connects. board.h TICKS_PER_M remains only the brief power-on
+    # fallback before ROS re-applies the saved runtime value.
+    ticks_per_meter: 399.0
+    # Runtime max wheel-speed cap [m/s], consumed by hardware_bridge_node and
+    # pushed to the STM32 (PACKET_ID_LL_SET_KINEMATICS) with wheel_track as the
+    # wheel base, so both can be retuned without reflashing. The firmware clamps
+    # this to at most its compiled MAX_MPS (board.h/template) — the wire can only
+    # LOWER the cap, never raise it above the compiled safety ceiling.
+    max_mps: 0.5
+    # Runtime SAFETY limits pushed to the STM32 (PACKET_ID_LL_SET_SAFETY_LIMITS)
+    # so the charge ceiling + e-stop timeouts can be TIGHTENED without reflashing.
+    # Defaults mirror the firmware compile-time board_defaults.h values. The
+    # firmware clamps every field so the wire can only make protection STRONGER:
+    # charge V/I clamped <= compiled ceiling; the four trip timeouts clamped
+    # <= compiled (faster e-stop); play_button_clear clamped >= compiled (harder
+    # to un-latch the emergency). An unconnected host runs the compiled defaults.
+    max_charge_voltage: 29.4          # [V] charge voltage ceiling
+    max_charge_current: 1.2           # [A] charge current ceiling
+    one_wheel_lift_emergency_ms: 2000 # [ms] one-wheel-lift trip
+    both_wheels_lift_emergency_ms: 1000 # [ms] both-wheels-lift trip
+    tilt_emergency_ms: 500            # [ms] tilt trip (mechanical + accelerometer)
+    stop_button_emergency_ms: 100     # [ms] stop-button trip
+    play_button_clear_emergency_ms: 2000 # [ms] hold-PLAY-to-clear-emergency
+    # Drive-motor wheel-velocity PID + feedforward (consumed by
+    # hardware_bridge_node, pushed to the STM32 firmware over the serial link so
+    # the GUI can retune the per-wheel loop without reflashing). These are the
+    # pre-calibration field defaults (surfaced in the GUI as "PID de vitesse des
+    # roues" / "Anticipation"); a per-robot auto-tune result overrides them in the
+    # sparse installed config. The firmware re-validates and clamps every value on
+    # receipt (kp 0-200, ki 0-20000, kd 0-500, integral_limit 0-255,
+    # pwm_per_mps 50-600).
+    wheel_pid_kp: 0.2            # proportional gain [PWM per m/s]
+    wheel_pid_ki: 0.092         # integral gain [PWM per (m/s·s)]
+    wheel_pid_kd: 0.01          # derivative gain [PWM per (m/s²)] (0 = off)
+    wheel_pid_integral_limit: 15.0   # anti-windup clamp on the integral term [PWM]
+    wheel_pid_pwm_per_mps: 282.135   # open-loop feedforward velocity→PWM scale
+    # Firmware gyro yaw-rate loop (Option C, 2026-07-17, task #33/#34 —
+    # replaces the removed host-side angular_rate_* PI). Consumed by
+    # hardware_bridge_node, pushed to the STM32 over PACKET_ID_LL_SET_YAW_PID
+    # (a separate packet from SET_DRIVE_PID). Defaults are the firmware's own
+    # power-on fallback (Firmware-2's #33 report). The firmware re-validates
+    # and clamps every value on receipt (yaw_kp 0-5, yaw_ki 0-20,
+    # yaw_trim_limit_mps 0-MAX_MPS=0.5).
+    yaw_kp: 0.12                  # P gain [m/s differential trim per rad/s yaw error]
+    yaw_ki: 0.40                  # I gain [m/s trim per (rad/s·s)]
+    yaw_trim_limit_mps: 0.15      # clamp on |differential trim| [m/s]
+    yaw_loop_enabled: true        # 1 = closed yaw loop on, 0 = open-diff passthrough
+    # gyro_sign (+1/-1): sign of the onboard gyro's Z axis vs robot +yaw (CCW).
+    # UNVALIDATED default (+1) — the field sign-check remedy if the loop
+    # diverges is to flip this without a firmware reflash.
+    yaw_gyro_sign: 1
     # Behavior tree tuning (consumed by behavior_tree_node)
     tick_rate: 10.0
     bt_debug_logging: false
+    # idle_nav2_suspend (default false): when true, the BT PAUSEs the Nav2
+    # lifecycle stack while parked on the dock so the costmaps stop looping and
+    # idle CPU/thermal load drops sharply. Nav2 is RESUMEd (collision_monitor
+    # back up) before any motion via the root Nav2ResumeGuard + Nav2ReadyPoll.
+    # Opt-in per site.
+    idle_nav2_suspend: false
     # IMU calibration (consumed by hardware_bridge_node — auto-triggered on dock)
     imu_cal_samples: 200
     imu_cal_persist_path: /ros2_ws/maps/imu_calibration.txt
@@ -80,7 +133,7 @@ mowgli:
     # -----------------------------------------------------------------
     lidar_x: 0.0               # forward offset from wheel axis (m)
     lidar_y: 0.024             # lateral offset (m)
-    lidar_z: 0.22              # vertical offset (m)
+    lidar_z: 0.30              # vertical offset (m)
     lidar_yaw: 3.1408          # heading offset (rad) — ~π for 180°-rotated mount
 
     # IMU mounting (relative to base_link = wheel axis centre)
@@ -106,7 +159,6 @@ mowgli:
     # true), and GNSS lever-arm + COG / mag unaries. Equivalent
     # functionality to the legacy ekf_map_node, with the option to
     # enable scan-matching + loop closure on LiDAR-equipped robots.
-    use_fusion_graph: true
 
     # use_magnetometer (default false): subscribe to /imu/mag_yaw and
     # let it influence the map-frame yaw. The chassis motor field
@@ -139,9 +191,11 @@ mowgli:
     # -----------------------------------------------------------------
     # GPS / Positioning
     # -----------------------------------------------------------------
-    gps_protocol: "UBX"
-    datum_lat: 0.0             # map origin latitude  (set per-site)
-    datum_lon: 0.0             # map origin longitude (set per-site)
+    gnss_receiver_family: "auto"
+    gnss_serial_device: "/dev/ttyAMA4"
+    gnss_serial_baud: 921600
+    datum_lat: 0.000000000     # map origin latitude  (set per-site)
+    datum_lon: 0.000000000     # map origin longitude (set per-site)
     gps_wait_after_undock_sec: 10.0   # wait for RTK fix after undocking
     gps_timeout_sec: 5.0              # pause mowing if no GPS for this long
 
@@ -156,43 +210,89 @@ mowgli:
     # -----------------------------------------------------------------
     # Battery
     # -----------------------------------------------------------------
-    battery_full_voltage: 28.5     # consider fully charged above this
+    battery_full_voltage: 28.0     # consider fully charged above this
     battery_empty_voltage: 24.0    # dock if below for sustained period
     battery_critical_voltage: 23.0 # immediate dock
     battery_full_percent: 95.0     # resume mowing above this %
     battery_low_percent: 20.0      # start docking
     battery_critical_percent: 10.0 # emergency dock
+    battery_critical_recovery_percent: 30.0 # leave critical-battery state once charged above this %
+                                            # (hysteresis upper bound; must be > battery_critical_percent)
 
     # -----------------------------------------------------------------
     # Mowing
     # -----------------------------------------------------------------
     mowing_enabled: true           # enable blade motor during mowing
     mowing_speed: 0.2              # m/s during coverage paths (field-validated comfortable cut speed)
-    transit_speed: 0.25            # m/s during point-to-point navigation (→ RPP desired_linear_vel)
-    outline_passes: 1              # perimeter passes before fill
-    outline_overlap: 0.0           # overlap between outline and fill (m)
-    outline_offset: 0.05           # inward offset from boundary (m)
-    mow_angle_offset_deg: -1.0    # -1 = auto-detect optimal angle
-    mow_angle_increment_deg: 0.0  # rotate pattern each full pass
-    headland_width: 0.18           # headland = 1 × tool_width
+    transit_speed: 0.2             # m/s during point-to-point navigation (→ RPP desired_linear_vel)
+    # mow_angle_deg: swath direction. -1 (or any negative) = AUTO — the coverage
+    # server picks the swath-count-minimising angle (F2C NSwath). 0..179 forces a
+    # fixed swath angle in degrees. Flows to the BT (behavior_tree_node blackboard)
+    # and into the plan_coverage action goal (PlanCoverageArea::buildGoal).
+    mow_angle_deg: -1.0
+    # NOTE: the former outline_passes / outline_overlap / outline_offset /
+    # mow_angle_offset_deg / mow_angle_increment_deg knobs were REMOVED — no ros2
+    # node read them (navigation.launch.py forwards only the keys below to
+    # coverage_server, and the BT hardcodes mow_angle_deg=-1.0 "auto"). They were
+    # dead controls. Use num_headland_passes / swath_overlap (below) instead.
+    headland_width: 0.18           # headland = 1 × tool_width. NOTE: currently INERT — the
+                                   # coverage BT (PlanCoverageArea) derives the F2C headland from
+                                   # chassis_width (ring_inset = 0.5*chassis_width + 0.05, then
+                                   # headland = ring_inset + 0.5*op_w ≈ 0.35) and sends it in the
+                                   # action goal, which overrides coverage_server.default_headland_width.
+                                   # To change the effective headland, change chassis_width or the
+                                   # derivation in coverage_nodes.cpp — not this key.
     # num_headland_passes: 0 = auto (= ceil(headland_width / tool_width)).
     # >0 forces exactly that many concentric perimeter rings, e.g. 1 for a
     # single perimeter pass, 2 for double, regardless of headland_width.
-    num_headland_passes: 0
-    # chassis_safety_inset: planning-time pull-back of the polygon edge
-    # before F2C generates swaths/headlands. Commented out so the
-    # navigation launch defaults it to chassis_width / 2 (= 0.20 m here),
-    # which keeps the chassis edge inside the operator polygon even under
-    # perfect FTC tracking. Override with an explicit metres value here
-    # to bias more (hard fences) or less (open lawn).
-    # chassis_safety_inset: 0.20
-    path_spacing: 0.18             # = tool_width for full coverage
-    min_turning_radius: 0.05       # skid-steer pivots in place; large values force wide F2C U-turns
+    num_headland_passes: 2         # 2026-07-23: field-validated default (was 0=auto)
+    # mow_direction: perimeter/headland travel winding (issue #335). 0 = planner
+    # default (F2C natural), 1 = clockwise, 2 = counter-clockwise. Set it so a
+    # side-mounted blade stays on the cut side. navigation.launch.py injects this
+    # into coverage_server.ring_direction; swaths/connectors follow the rings.
+    mow_direction: 0
+    # chassis_safety_inset: how far INSIDE the recorded boundary the OUTERMOST
+    # headland ring's centerline sits. 0.0 (default) = the ring rides ON the
+    # recorded line — the perimeter the operator drove — so the blade mows to the
+    # edge and the chassis is allowed to STRADDLE the boundary. coverage_server
+    # applies the op_width/2 outward expansion itself (generateHeadlandSwaths puts
+    # ring 0 op_width/2 inside the planning field), so a value of 0 lands ring 0
+    # exactly on the line. The safety stop is the LETHAL band the keepout mask
+    # places OUTSIDE the line (0.40 m out, enforce_boundary_margin_m), not an
+    # inward inset. Raise this to keep the chassis further inside (e.g.
+    # chassis_width/2 = 0.20 to keep the WHOLE chassis inside, the old behaviour,
+    # at the cost of a ~0.20 m uncut perimeter band). This keep-inside guarantee
+    # now holds through TURNS as well: the turn-around connectors are clipped to
+    # the outermost-ring centerline (recorded line minus this inset), so a U-turn
+    # arc's chassis no longer bulges ~op_width/2 past the perimeter ring the way it
+    # did before (that outward bulge grew with the turn radius). Read LIVE by
+    # coverage_server (ros2-param-set-tunable).
+    chassis_safety_inset: 0.2       # 2026-07-23: field-validated default (was 0.0) — keep whole chassis inside the boundary, un-wedges the outermost ring
+    # path_spacing: DEPRECATED / informational — no ROS2 node reads it. F2C swath
+    # spacing is driven by tool_width (coverage_server.operation_width); a separate
+    # spacing value re-opens the swath-gap bug, so this only mirrors tool_width.
+    path_spacing: 0.18             # = tool_width (informational only)
+    # swath_overlap: F2C swath spacing = tool_width − swath_overlap, so adjacent
+    # swaths overlap by this much. Covers the headland↔swath seam + BruteForce
+    # edge margins (harness: 95 % → 100 % on the 9×6 m field). tool_width (the
+    # map_server stamp radius) is unchanged. 0 = swaths exactly tool_width apart.
+    swath_overlap: 0.02
+    # min_turning_radius: hard floor on every forward turn-around / corner-fillet
+    # arc in the CONTINUOUS coverage path (coverage_server → buildContinuousPath),
+    # injected into coverage_server.min_turning_radius — so this is LIVE.
+    # Two-sided: too small → the in-bounds shrink picks a loop tighter than MPPI
+    # can track (wz≈vx/r), so the robot loops/hesitates at corners; too large →
+    # the Ω-turn bulges OUTSIDE the polygon at the swath ends (R=0.35 left the
+    # area by ~0.8 m, then got clipped into ragged turns). 0.15 m keeps every turn
+    # fully in-bounds (harness: 0 cm bulge) and stays MPPI-trackable. A turn that
+    # cannot be made in-bounds at >= this is left as a sharp pivot, never a
+    # tighter loop. Keep within [0.10, 0.50].
+    min_turning_radius: 0.15
 
     # -----------------------------------------------------------------
     # Docking
     # -----------------------------------------------------------------
-    dock_pose_x: 0.0              # dock position in map frame (set per-site)
+    dock_pose_x: 0.0             # sim: robot at world origin; area is centred on origin instead
     dock_pose_y: 0.0
     # dock_pose_yaw MUST be a map-frame ENU yaw (rad) — opennav_docking
     # consumes it directly as the dock heading. Set it via the GUI
@@ -202,8 +302,8 @@ mowgli:
     # /odometry/filtered_map yaw equals this. NOTE: 4.17 below is a stale
     # hand-entered phone-compass seed (239°) — NOT a valid ENU yaw;
     # recalibrate per-site before relying on docking.
-    dock_pose_yaw: 4.17
-    undock_distance: 1.5           # reverse distance when undocking (m)
+    dock_pose_yaw: 0.0             # sim: match MowgliMower world rotation (yaw 0, facing +X/east)
+    undock_distance: 1.5           # reverse distance when undocking (m); must be > 0.5 m for CalibrateHeadingFromUndock
     undock_speed: 0.16             # reverse speed (m/s) — above kMinLinVel=0.15 host clamp
     # Distance (m) to the staging pose behind the dock — the final
     # straight-in approach runway. Injected as opennav_docking
@@ -227,6 +327,43 @@ mowgli:
     # the cradle reached. 0.3 = solid contact past the spring detent on
     # the YardForce charger; lower stops short, higher over-presses.
     dock_charging_threshold: 0.3
+    # Approach the dock off RTK-Fixed /gps/absolute_pose instead of the
+    # fusion_graph map→odom TF. fusion_graph can reload CORRUPT after a
+    # dock-arrival graph save (yaw flips, a metre-scale jump), which sends the
+    # robot ~2 m off the cradle and times the docking action out. With this on,
+    # gps_dock_detection_node publishes the true dock contact pose (GPS + the
+    # calibrated dock_pose_*, expressed in the continuous odom frame — never via
+    # map→odom) on /docking_server/detected_dock_pose, and opennav_docking's
+    # SimpleChargingDock tracks THAT (use_external_detection_pose). Set false to
+    # use the legacy graph-TF approach — e.g. at cradles where GPS only Floats
+    # (the GPS detection requires RTK-Fixed; on Float it holds the last good
+    # fix, and only the legacy path is GPS-independent).
+    use_gps_dock_detection: true
+
+    # -----------------------------------------------------------------
+    # One-click dock calibration (dock_calibration_node / CalibrateDock action)
+    # -----------------------------------------------------------------
+    # Straight reverse leg off the dock (blade OFF, driven on /cmd_vel_docking
+    # so collision_monitor stays in the loop). Distinct from undock_distance/
+    # _speed: the calibration wants a longer, slower reverse for a tight COG
+    # heading fit. 2.0 m @ 0.15 m/s is the maintainer-locked default.
+    dock_calib_reverse_distance_m: 2.0
+    dock_calib_reverse_speed_ms: 0.15
+    # Extra forward travel (m) past the captured on-dock GPS point on the
+    # re-dock leg, so the charging contacts seat before we declare success.
+    dock_calib_redock_overshoot_m: 0.30
+    # Timeouts (s): wait for RTK-Fixed before starting; wait for is_charging on
+    # the forward re-dock before failing with NO_CHARGE_ON_REDOCK.
+    dock_calib_rtk_wait_timeout_s: 10.0
+    dock_calib_redock_charge_timeout_s: 30.0
+    # COG-coherence gate over the reverse leg (Resolution A — dock_yaw =
+    # circular_mean of the /imu/cog_heading BODY-heading samples, NO +pi;
+    # cross-checked against the reversed GPS travel bearing). See
+    # dock_cog_gate.hpp. Fail (b)/(c) => COG_INCOHERENT => operator retries.
+    dock_calib_cog_min_samples: 8                    # (a) min valid /imu/cog_heading samples
+    dock_calib_cog_std_max_rad: 0.0524              # (b) ~3° circular-std ceiling
+    dock_calib_cog_bearing_match_max_rad: 0.1047    # (c) ~6° COG-vs-GPS-bearing match
+    dock_calib_min_baseline_displacement_m: 0.5      # (d) min reverse displacement for a fit
 
     # -----------------------------------------------------------------
     # Rain
@@ -242,16 +379,148 @@ mowgli:
     motor_temp_high_c: 80.0        # stop blade if motor exceeds
     motor_temp_low_c: 40.0         # resume blade below this
     # Lift/tilt emergency is handled by firmware (STM32), not ROS2
-    max_obstacle_avoidance_distance: 2.0  # how far to deviate from path
+
+    # -----------------------------------------------------------------
+    # Obstacles (GUI: Settings → Obstacles)
+    # -----------------------------------------------------------------
+    # How far the robot may deviate laterally from its path to skirt an
+    # obstacle. ONE knob, TWO consumers (injected at launch):
+    #   - FTCController max_lateral_deviation (coverage-time skirting)
+    #   - map_server bypass_max_length (give-up threshold for the mow-progress
+    #     bypass corridor)
+    # Clamped to [0.5, 10.0] by navigation.launch.py.
+    max_obstacle_avoidance_distance: 1.0   # 2026-07-23: field-validated default (was 3.0)
+    # Inflation radius (m) around LiDAR-detected obstacles in the LOCAL
+    # costmap — the buffer FTC/RPP keep from trunks, legs, walls seen by the
+    # scan. Injected into local_costmap.inflation_layer.inflation_radius.
+    # Clamped to [0.58, 1.50]: the nav2 inflation layer degrades
+    # footprint-cost semantics below the chassis circumscribed radius
+    # (~0.572 m), and FTC's deviation detector (cost threshold 253) assumes
+    # the inscribed band exists. Raise this if the robot passes too close to
+    # trees it can see. Does NOT affect the global costmap (its 0.20 m radius
+    # is pinned — larger values blocked transit paths, see nav2_params_base).
+    # 1.0 (was 0.80, was 0.60 before that) — task #35, 2026-07-17: field
+    # analysis showed obstacles only pushing the path from 0.4-0.6 m out at
+    # ~0.17 m/s, reacting too late for a smooth deviation; 0.80 was the
+    # first bump. Task #43, same day: the user's own field-converged value
+    # is 1.0, superseding #35's 0.80 — folded in as the new template default.
+    # NAV2-TRANSIT ONLY (task #49, 2026-07-17): only MPPI/RPP's cost-based
+    # potential field (point-to-point transit driving) reads the inflation
+    # GRADIENT this radius controls. FTC (the coverage/mowing controller)
+    # checks raw LETHAL cells only (obstacle_deviation.hpp kLethalThreshold),
+    # never the inflated gradient — this knob has NO effect on how far out
+    # the robot starts avoiding an obstacle WHILE MOWING. For that, see
+    # obstacle_detection_range_m below.
+    # 0.58 (was 1.0, 2026-07-23): a 1.0 m halo smeared a side obstacle's cost
+    # across the whole front of a narrow (0.5-1.0 m) gap, so RPP transit saw
+    # "collision ahead" and Nav2 backup/spin recoveries could not back out of a
+    # physically-passable pocket (obstacle-wedge). Clamp-floored at 0.58 in
+    # navigation.launch.py (chassis circumscribed radius ~0.572); this is the
+    # smallest value the inflation layer supports without degrading footprint-
+    # cost semantics. Values below 0.58 are raised to 0.58 at launch.
+    obstacle_inflation_radius: 0.58
+    # How far ahead along the coverage path (m) FTC scans for a lethal
+    # obstacle cell before starting to skirt it — the real "avoid from
+    # further out during mowing" knob (task #49; obstacle_inflation_radius
+    # above does NOT affect this, see its comment). Injected into
+    # FollowCoveragePath.obstacle_lookahead (nav2_params_base.yaml) as a
+    # pose count: poses = round(this / kF2CSamplingM), kF2CSamplingM=0.05
+    # (navigation.launch.py). 1.0 m = 20 poses, ≈5 s of warning at mowing_speed
+    # 0.2 m/s. Clamped to [0.2, 5.0] m (>=4 poses so the detector always has a
+    # usable lookahead window). 1.0 (was 1.5): FTC now models the true chassis
+    # FOOTPRINT (use_footprint_clearance in nav2_params_base.yaml) rather than a
+    # swept ±half_width line, so it reacts on the real body edge and needs less
+    # forward warning to skirt smoothly.
+    obstacle_detection_range_m: 2.0        # 2026-07-23: field-validated default (was 1.0) — earlier obstacle warning
+    # How much SIDEWAYS room (m) FTC leaves beyond the chassis when it skirts a
+    # detected obstacle. Raise this if the robot goes around obstacles but
+    # shaves past them. With the footprint model, the chassis FOOTPRINT is
+    # expanded LATERALLY by this margin for the clearance search ONLY — detection
+    # reach (obstacle_detection_range_m above) is unaffected, which is why this
+    # is a separate knob: widening the body instead would also widen detection
+    # and re-open the "deviation > max -> hold 5 s" stalls. NOTE
+    # obstacle_inflation_radius canNOT buy this margin — the footprint checks
+    # threshold at cost 254 (TRUE lethal), above the inflation band entirely, so
+    # raising inflation only grows the 1..253 region the check ignores. Clamped
+    # [0.0, 0.50] (above ~0.5 the widened footprint trips the mowing-zone guard
+    # on headland rings that hug the boundary, converting skirts into stalls).
+    # 0.05 (was 0.10): the footprint already models the true body edge, so the
+    # old margin — sized to cover the line model's centerline-miss gap — is now
+    # double what's needed; halved to keep skirts tight while still clearing.
+    obstacle_clearance_margin: 0.2         # 2026-07-23: field-validated default (was 0.05) — wider sideways room past obstacles
+    # How long (s) FTC holds zero velocity on a blocked or over-max deviation
+    # before aborting the strip and handing back to the BT. Debounces transient
+    # LiDAR returns (a person crossing) so they don't burn a BT retry.
+    # Clamped [0.5, 60.0].
+    obstacle_wait_timeout_s: 2.5
+    # Bounded reverse-escape (SAFETY-CRITICAL). When BOTH sides of an obstacle
+    # are blocked — or the skirt needed exceeds max_lateral_deviation — FTC backs
+    # STRAIGHT up (no rotation) a bounded distance and re-attempts the deviation
+    # search from the new pose, BEFORE holding zero velocity and aborting the
+    # strip. The rear chassis footprint is checked against TRUE-lethal cells
+    # before every reverse tick; the maneuver fails safe (stops → wait/abort) on
+    # any ambiguity (no footprint, rear obstacle, budget spent). This is a
+    # distinct escape sub-state and does NOT relax the forward-only behaviour of
+    # normal path following. OPT-IN — bounded reverse-escape drives the robot
+    # BACKWARDS; enable only after a supervised field test (see PR notes). Fails
+    # safe (wedged → hold/abort as before) when it cannot find a lethal-clear
+    # rear corridor.
+    # true (was false, 2026-07-23): a blade-on coverage wedge (FTC 'Failed to
+    # make progress' beside an obstacle with both skirt sides blocked) has no
+    # forward escape; the bounded rear-lethal-gated reverse is the only self-
+    # recovery. SAFETY: still requires a supervised field test near the dock /
+    # people — the maneuver is fail-safe by construction (0.30 m cap, rear
+    # TRUE-lethal check every tick, stop on any ambiguity).
+    obstacle_reverse_enabled: true
+    # Hard cap on total reversed distance (m) per escape. Odom-integrated, never
+    # exceeded. Clamped [0.0, 1.0] by navigation.launch.py.
+    obstacle_reverse_max_dist_m: 0.30
+    # Straight reverse speed (m/s). Must clear the firmware ~0.05 deadband to
+    # move at all. Clamped [0.0, 0.30] by navigation.launch.py.
+    obstacle_reverse_speed_mps: 0.15       # 2026-07-23: field-validated default (was 0.10) — clears firmware deadband to actually move
+    # Extra margin (m) grown around DRAWN map obstacle polygons, applied in
+    # BOTH the coverage planner (F2C holes are buffered outward before swath
+    # planning) and the keepout mask (cells within the margin of an obstacle
+    # polygon are LETHAL for transit planning). Use it to keep the robot off
+    # root zones: draw the tree trunk as an obstacle and set the margin to
+    # cover the roots (the 2D LiDAR cannot see them — they are below the
+    # scan plane). Clamped to [0.0, 1.0].
+    obstacle_margin: 0.2                    # 2026-07-23: field-validated default (was 0.15) — wider buffer around drawn obstacles
+    # collision_monitor PolygonSlow slowdown factor when a scan return is
+    # inside the chassis+15 cm approach box (LiDAR variant only). 0.3 = slow
+    # to 30 % of commanded speed. Clamped to [0.05, 1.0].
+    obstacle_slowdown_ratio: 0.7           # 2026-07-23: field-validated default (was 0.5)
 
     # -----------------------------------------------------------------
     # Navigation tolerances (garden terrain)
     # -----------------------------------------------------------------
-    # 0.30 m / 0.10 rad (was 0.75 / 1.0). The previous values let FTC
-    # report SUCCESS with the chassis 25-40° off the goal yaw, which
-    # made opennav_docking attack the cradle "en biais" (sideways). 0.10
-    # rad (≈5.7°) forces a final in-place pivot before the dock approach.
-    xy_goal_tolerance: 0.30        # metres — acceptable goal position error
-    yaw_goal_tolerance: 0.10       # radians — acceptable heading error
-    coverage_xy_tolerance: 0.10    # metres — for coverage waypoints
-    progress_timeout_sec: 60.0     # seconds without progress before recovery
+    # History: 0.75/1.0 rad let FTC report SUCCESS with the chassis 25-40°
+    # off the goal yaw, which made opennav_docking attack the cradle
+    # "en biais" (sideways) — tightened to 0.30 m / 0.10 rad to force a
+    # final in-place pivot before the dock approach.
+    # Task #43, 2026-07-17: folded in the user's field-converged values,
+    # tighter on position (0.10 m) but LOOSER on yaw (0.20 rad ≈ 11.4°)
+    # than the 0.10 rad fix above. FLAGGED to team-lead/user: re-verify
+    # docking approach heading is still square (not "en biais") with the
+    # looser yaw tolerance — the #37/#39 firmware yaw-loop fixes (same
+    # session) may be why 0.20 rad is now safe, but this reopens the exact
+    # failure mode the 0.10 rad value was chosen to close.
+    xy_goal_tolerance: 0.1         # metres — acceptable goal position error
+    yaw_goal_tolerance: 0.1        # radians — acceptable heading error
+    coverage_xy_tolerance: 0.50    # metres — must be >= FTC max_goal_distance_error (0.50): FTC parks that far short of the goal, so a tighter gate never completes the area (re-mow). Floored at FTC's value by navigation.launch.py.
+    # Feeds controller_server progress_checker.movement_time_allowance (via
+    # navigation.launch.py — it OVERWRITES the value in nav2_params_base.yaml).
+    # How long the robot may fail to move required_movement_radius (0.15 m) on a
+    # FollowCoveragePath strip before Nav2 aborts it (err 105 "Failed to make
+    # progress"). On abort the coverage BT steps the resume cursor ~0.80 m past
+    # the stall and skips that span, leaving an un-mowed band.
+    # 2026-07-23 (#396): raised 10.0 → 30.0. At 10 s a transient localization
+    # jump (RTK wrong-fix rejection flood + snap) coinciding with a
+    # collision_monitor approach-slow near a boundary reliably stalled the strip
+    # long enough to abort mid-swath, producing ~0.80 m un-mowed bands after an
+    # otherwise-successful mow. The robot recovers from these jumps within
+    # ~12-15 s; 30 s rides through them with margin while still catching a truly
+    # stuck robot. Genuine wedges are handled by collision_monitor + FTC
+    # obstacle-deviation + reverse-escape, not this timer, so the longer wait is
+    # a coverage-completeness gain, not a safety regression.
+    progress_timeout_sec: 30.0     # seconds without progress before a strip is aborted+skipped

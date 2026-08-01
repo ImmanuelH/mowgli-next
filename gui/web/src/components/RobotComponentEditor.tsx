@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Alert, App, Card, InputNumber, Modal, Space, Typography, Row, Col, Tooltip, Button, Tag } from "antd";
 import { AimOutlined, CompassOutlined, EnvironmentOutlined, UndoOutlined } from "@ant-design/icons";
 import { useThemeMode } from "../theme/ThemeContext.tsx";
+import { getColors, inkAlpha } from "../theme/colors.ts";
 import { useIsMobile } from "../hooks/useIsMobile.ts";
 import { useRobotDescription } from "../hooks/useRobotDescription.ts";
 import { useCalibrationStatus } from "../hooks/useCalibrationStatus.ts";
@@ -38,12 +40,19 @@ type SensorMeta = {
     zKey: string;
 };
 
+// Sensor palette is sourced from the brand tokens (no raw hex). `color` is the
+// light-mode tint, `colorDark` the brighter dark-mode variant used on the deep
+// canvas. LiDAR = danger (rose), IMU = info/sky (aurora cyan), GPS = primary
+// (lime).
+const LIGHT_TOKENS = getColors("light");
+const DARK_TOKENS = getColors("dark");
+
 const SENSORS: SensorMeta[] = [
     {
         id: "lidar",
         label: "LiDAR",
-        color: "#E53935",
-        colorDark: "#EF5350",
+        color: LIGHT_TOKENS.danger,
+        colorDark: DARK_TOKENS.danger,
         shape: "circle",
         size: 0.04,
         xKey: "lidar_x",
@@ -54,8 +63,8 @@ const SENSORS: SensorMeta[] = [
     {
         id: "imu",
         label: "IMU",
-        color: "#1565C0",
-        colorDark: "#42A5F5",
+        color: LIGHT_TOKENS.info,
+        colorDark: DARK_TOKENS.sky,
         shape: "rect",
         size: 0.03,
         xKey: "imu_x",
@@ -66,8 +75,8 @@ const SENSORS: SensorMeta[] = [
     {
         id: "gps",
         label: "GPS",
-        color: "#2E7D32",
-        colorDark: "#66BB6A",
+        color: LIGHT_TOKENS.primary,
+        colorDark: DARK_TOKENS.primary,
         shape: "rect",
         size: 0.05,
         xKey: "gps_x",
@@ -77,15 +86,18 @@ const SENSORS: SensorMeta[] = [
     },
 ];
 
-// Convert robot metres to SVG coordinates
-// Robot frame: X = forward, Y = left
-// SVG: robot faces right (+X to right, +Y down = robot's -Y)
+// Convert robot metres to SVG coordinates.
+// Robot frame (REP-103): X = forward, Y = left.
+// SVG is a top-down view with the robot facing UP (matching RobotAnatomy and
+// the URDF's natural orientation): +X (forward) → up, +Y (left) → left. Drawing
+// the robot facing right made the drive-wheel discs — whose diameter runs along
+// the rolling/forward axis — appear as horizontal bars (issue #404).
 const toSvg = (rx: number, ry: number, cx: number, cy: number): [number, number] => {
-    return [cx + rx * SCALE, cy - ry * SCALE];
+    return [cx - ry * SCALE, cy - rx * SCALE];
 };
 
 const fromSvg = (sx: number, sy: number, cx: number, cy: number): [number, number] => {
-    return [(sx - cx) / SCALE, -(sy - cy) / SCALE];
+    return [(cy - sy) / SCALE, (cx - sx) / SCALE];
 };
 
 const roundTo = (v: number, decimals: number): number => {
@@ -115,6 +127,7 @@ type Props = {
 };
 
 export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
+    const { t } = useTranslation();
     const { colors, mode } = useThemeMode();
     const isMobile = useIsMobile();
     const svgRef = useRef<SVGSVGElement>(null);
@@ -154,15 +167,27 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
             // dock. use_gps_position=true tells map_server to capture the dock
             // POSITION from the averaged independent GPS projection, NOT the px/py
             // we send (which come from the fused pose — gauge-reset onto the old
-            // dock_pose while charging, so it would be circular). Yaw is taken
-            // from our quaternion (single-antenna GPS gives no heading).
+            // dock_pose while charging, so it would be circular).
+            //
+            // Task #45 (from #44's circularity trace): the SAME gauge-reset
+            // circularity poisons the fused YAW while charging just as much as
+            // position — fusion_graph pins the fused yaw to the EXISTING
+            // dock_pose_yaw, so it can never self-correct via a live capture.
+            // map_server's on_set_docking_point now PRESERVES the existing
+            // dock_pose_yaw whenever use_gps_position=true and ignores the
+            // orientation we send below — we still send a quaternion because the
+            // service request shape requires one, but it is a no-op server-side
+            // for this call. Dock heading only changes via the motion-derived
+            // calibration (calibrate_imu_yaw_node's dock-yaw drive, or the
+            // per-undock refinement) — see the "Run Calibration" action.
             //
             // Because the stored position is the GPS one (not our px/py), we must
             // NOT optimistically push px/py into the form — that was the bug: it
             // showed the fused value and a later Settings "Save" would overwrite
             // the GPS value. Instead, after the service persists, read the actual
             // stored dock pose back from /calibration/status (which reads
-            // mowgli_robot.yaml) and reflect THAT in the form.
+            // mowgli_robot.yaml) and reflect THAT in the form — this also
+            // correctly reflects the now-unchanged yaw.
             const q = getQuaternionFromHeading(yaw);
             try {
                 setSettingDock(true);
@@ -194,18 +219,17 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                 onChange("dock_pose_y", roundTo(storedY, 3));
                 onChange("dock_pose_yaw", roundTo(storedYaw, 4));
                 notification.success({
-                    message: "Dock pose set (from GPS)",
-                    description:
-                        "Captured the dock position from the averaged GPS fix and persisted to mowgli_robot.yaml. The map indicator jumps to the new pose on the next /map publish.",
+                    message: t("robotComponentEditor.dockPoseSetFromGps"),
+                    description: t("robotComponentEditor.dockPoseSetFromGpsDescription"),
                 });
             } catch (e: unknown) {
-                const message = e instanceof Error ? e.message : "Unknown error";
-                notification.error({message: "Failed to set dock pose", description: message});
+                const message = e instanceof Error ? e.message : t("robotComponentEditor.unknownError");
+                notification.error({message: t("robotComponentEditor.failedToSetDockPose"), description: message});
             } finally {
                 setSettingDock(false);
             }
         },
-        [guiApi, notification, onChange],
+        [guiApi, notification, onChange, t],
     );
 
     // Open a confirmation modal that previews the change and spells out
@@ -213,7 +237,7 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
     // this action without a confirm step (#173).
     const handleSetDockAtRobot = useCallback(() => {
         if (!poseAvailable) {
-            notification.warning({message: "No robot pose available yet"});
+            notification.warning({message: t("robotComponentEditor.noRobotPoseYet")});
             return;
         }
         const px = robotX!;
@@ -237,46 +261,46 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
             title: (
                 <Space>
                     <EnvironmentOutlined/>
-                    <span>Set dock pose from current robot position?</span>
+                    <span>{t("robotComponentEditor.setDockFromPoseTitle")}</span>
                 </Space>
             ),
             width: 520,
-            okText: "Set dock pose",
+            okText: t("robotComponentEditor.setDockPose"),
             okType: "primary",
-            cancelText: "Cancel",
+            cancelText: t("robotComponentEditor.cancel"),
             content: (
                 <div>
                     <Typography.Paragraph>
-                        This captures the robot's <strong>x, y AND heading</strong> right now and
-                        writes them to <code>mowgli_robot.yaml</code> as the new dock pose. The
-                        IMU auto-calibration that runs on the next docking will refine the yaw
-                        if it drifts.
+                        {t("robotComponentEditor.setDockConfirmIntro1")}{" "}
+                        <strong>{t("robotComponentEditor.setDockConfirmXYHeading")}</strong>{" "}
+                        {t("robotComponentEditor.setDockConfirmIntro2")}{" "}
+                        <code>mowgli_robot.yaml</code>{" "}
+                        {t("robotComponentEditor.setDockConfirmIntro3")}
                     </Typography.Paragraph>
                     <Card size="small" style={{marginBottom: 8}}>
                         <Row gutter={[8, 4]}>
-                            <Col span={8}><Text type="secondary" style={{fontSize: 11}}>Current robot</Text></Col>
+                            <Col span={8}><Text type="secondary" style={{fontSize: 11}}>{t("robotComponentEditor.currentRobot")}</Text></Col>
                             <Col span={5}>x: <strong>{fmt(px, " m")}</strong></Col>
                             <Col span={5}>y: <strong>{fmt(py, " m")}</strong></Col>
-                            <Col span={6}>bearing: <strong>{yawDeg}°</strong></Col>
+                            <Col span={6}>{t("robotComponentEditor.bearing")}: <strong>{yawDeg}°</strong></Col>
                         </Row>
                         <Row gutter={[8, 4]} style={{marginTop: 4}}>
-                            <Col span={8}><Text type="secondary" style={{fontSize: 11}}>Saved dock</Text></Col>
+                            <Col span={8}><Text type="secondary" style={{fontSize: 11}}>{t("robotComponentEditor.savedDock")}</Text></Col>
                             <Col span={5}>x: <strong>{fmt(savedX, " m")}</strong></Col>
                             <Col span={5}>y: <strong>{fmt(savedY, " m")}</strong></Col>
-                            <Col span={6}>bearing:{" "}
+                            <Col span={6}>{t("robotComponentEditor.bearing")}:{" "}
                                 <strong>{savedYawRad == null ? "—" : `${roundTo(yawRadToCompassBearing(savedYawRad), 1)}°`}</strong>
                             </Col>
                         </Row>
                     </Card>
                     <Typography.Paragraph type="secondary" style={{fontSize: 11, marginBottom: 0}}>
-                        Make sure the robot is sitting on the dock and facing the direction it
-                        should approach from. The new pose persists across container restarts.
+                        {t("robotComponentEditor.setDockConfirmFooter")}
                     </Typography.Paragraph>
                 </div>
             ),
             onOk: () => writeDockPose(px, py, yawRad),
         });
-    }, [poseAvailable, robotX, robotY, robotYaw, values.dock_pose_x, values.dock_pose_y, values.dock_pose_yaw, writeDockPose, notification, modal]);
+    }, [poseAvailable, robotX, robotY, robotYaw, values.dock_pose_x, values.dock_pose_y, values.dock_pose_yaw, writeDockPose, notification, modal, t]);
     // Dock yaw lives in mowgli_robot.yaml. It is normally written by the
     // IMU auto-calibration service and the "set dock pose" GUI action,
     // but operators can also override it manually here when calibration
@@ -311,7 +335,12 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
     const svgWidth = isMobile ? 340 : 520;
     const svgHeight = isMobile ? 380 : 480;
     const cx = svgWidth / 2;
-    const cy = svgHeight / 2;
+    // Facing-up view: the chassis extends forward (up) from base_link by
+    // chassis_center_x + baseLength/2, and the dock is drawn further in front.
+    // Push the base_link origin down so that forward extent + dock stay on
+    // canvas while keeping the rear axle above the bottom edge.
+    const forwardExtentPx = (robot.chassisCenterX + robot.baseLength / 2 + 0.16) * SCALE;
+    const cy = Math.min(svgHeight - 40, Math.max(svgHeight / 2, 24 + forwardExtentPx));
 
     const getSensorValue = useCallback(
         (meta: SensorMeta): SensorConfig => ({
@@ -364,7 +393,10 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
             if (rotating && meta.yawKey) {
                 const sensorVal = getSensorValue(meta);
                 const [ssx, ssy] = toSvg(sensorVal.x, sensorVal.y, cx, cy);
-                const angle = Math.atan2(-(sy - ssy), sx - ssx);
+                // Facing-up frame: yaw is CCW from +X (up). A pointer offset
+                // (dx, dy) in SVG maps back to robot X = -dy, Y = -dx, so
+                // yaw = atan2(-dx, -dy) = atan2(ssx - sx, ssy - sy).
+                const angle = Math.atan2(ssx - sx, ssy - sy);
                 onChange(meta.yawKey, roundTo(angle, 4));
             }
         };
@@ -422,21 +454,26 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
         const ccx = robot.chassisCenterX; // chassis centre offset from base_link
         const halfL = robot.baseLength / 2;
         const halfW = robot.baseWidth / 2;
-        const bodyColor = mode === "dark" ? "#2d5a2d" : "#4CAF50";
-        const bodyStroke = mode === "dark" ? "#3d7a3d" : "#2E7D32";
-        const wheelColor = mode === "dark" ? "#555" : "#333";
-        const bladeColor = mode === "dark" ? "#888" : "#9E9E9E";
-        const casterColor = mode === "dark" ? "#666" : "#555";
+        const bodyColor = mode === "dark" ? colors.emeraldDeep : colors.primaryLight;
+        const bodyStroke = mode === "dark" ? colors.mint : colors.primaryDark;
+        const wheelColor = mode === "dark" ? inkAlpha(0.35) : inkAlpha(0.7);
+        const bladeColor = colors.muted;
+        const casterColor = mode === "dark" ? inkAlpha(0.25) : inkAlpha(0.55);
 
-        // Chassis rect offset by chassisCenterX (base_link is at wheel axis, not chassis centre)
-        const [bx, by] = toSvg(ccx - halfL, halfW, cx, cy);
-        const bw = robot.baseLength * SCALE;
-        const bh = robot.baseWidth * SCALE;
+        // Chassis rect offset by chassisCenterX (base_link is at the rear wheel
+        // axis, not the chassis centre). Facing up, the front-left corner maps
+        // to the SVG top-left; the box spans baseWidth horizontally and
+        // baseLength vertically.
+        const [bx, by] = toSvg(ccx + halfL, halfW, cx, cy);
+        const bw = robot.baseWidth * SCALE;
+        const bh = robot.baseLength * SCALE;
 
         const leftWheel = toSvg(robot.wheelXOffset, robot.wheelTrack / 2, cx, cy);
         const rightWheel = toSvg(robot.wheelXOffset, -robot.wheelTrack / 2, cx, cy);
-        const ww = robot.wheelRadius * 2 * SCALE;
-        const wh = robot.wheelWidth * SCALE;
+        // Drive-wheel disc seen from above: its diameter runs along the forward
+        // (vertical) axis, the thin tyre width runs laterally (horizontal).
+        const ww = robot.wheelWidth * SCALE;
+        const wh = robot.wheelRadius * 2 * SCALE;
 
         const leftCaster = toSvg(robot.casterXOffset, robot.casterTrack / 2, cx, cy);
         const rightCaster = toSvg(robot.casterXOffset, -robot.casterTrack / 2, cx, cy);
@@ -448,57 +485,62 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
         const arrowTip = toSvg(ccx + halfL + 0.04, 0, cx, cy);
         const arrowLeft = toSvg(ccx + halfL + 0.01, 0.02, cx, cy);
         const arrowRight = toSvg(ccx + halfL + 0.01, -0.02, cx, cy);
-        const arrowColor = mode === "dark" ? "rgba(255,255,255,0.4)" : "rgba(0,0,0,0.3)";
+        const arrowColor = mode === "dark" ? inkAlpha(0.4) : "rgba(0,0,0,0.3)";
 
         // Dock charging station in front of the robot (robot drives forward to dock)
-        const dockFill = mode === "dark" ? "#333" : "#999";
-        const dockStroke = mode === "dark" ? "#555" : "#777";
-        const contactColor = mode === "dark" ? "#c90" : "#d4a017";
-        const dockLabelColor = mode === "dark" ? "rgba(255,255,255,0.4)" : "rgba(0,0,0,0.35)";
-        // Base plate in front of chassis
+        const dockFill = mode === "dark" ? inkAlpha(0.16) : inkAlpha(0.6);
+        const dockStroke = mode === "dark" ? inkAlpha(0.3) : inkAlpha(0.45);
+        const contactColor = colors.warning;
+        const dockLabelColor = mode === "dark" ? inkAlpha(0.4) : "rgba(0,0,0,0.35)";
+        // Dock station drawn in FRONT of the robot (forward = up). All
+        // positions are expressed in robot metres and projected through toSvg
+        // so the dock rotates with the facing-up view like the rest of the body.
         const frontEdge = ccx + halfL;
-        const plateW = (robot.baseWidth + 0.08) * SCALE;
-        const plateH = 0.12 * SCALE;
-        const plateX = cx + (frontEdge + 0.02) * SCALE; // just in front of robot
-        const plateY = cy - plateW / 2;
-        // Back wall (the wall the robot pushes against)
-        const wallH = 0.02 * SCALE;
-        const wallTall = plateW * 0.6;
-        const wallX = plateX + plateH; // far edge of plate
-        // Charging contacts (two copper strips on the dock face)
-        const contactW = 0.015 * SCALE;
-        const contactH = 0.04 * SCALE;
-        const contactGap = robot.wheelTrack * 0.35 * SCALE;
-        const contactX = plateX + plateH * 0.1; // near the robot-facing edge
+        const plateSpan = robot.baseWidth + 0.08;    // lateral extent (horizontal)
+        const plateDepth = 0.12;                     // forward extent (vertical)
+        const plateNear = frontEdge + 0.02;          // edge nearest the robot
+        const plateFar = plateNear + plateDepth;
+        const [plateX, plateY] = toSvg(plateFar, plateSpan / 2, cx, cy); // top-left
+        const plateWpx = plateSpan * SCALE;
+        const plateHpx = plateDepth * SCALE;
+        // Back wall (the wall the robot pushes against) at the far edge.
+        const [wallX] = toSvg(plateFar, plateSpan * 0.3, cx, cy);
+        const wallWpx = plateSpan * 0.6 * SCALE;
+        const wallHpx = 0.02 * SCALE;
+        // Charging contacts: two copper strips on the robot-facing edge.
+        const contactWpx = 0.04 * SCALE;             // lateral width (horizontal)
+        const contactHpx = 0.015 * SCALE;            // forward depth (vertical)
+        const [contactLX, contactLY] = toSvg(plateNear + 0.01, robot.wheelTrack * 0.35, cx, cy);
+        const [contactRX, contactRY] = toSvg(plateNear + 0.01, -robot.wheelTrack * 0.35, cx, cy);
 
         return (
             <g>
                 {/* Dock base plate */}
                 <rect
-                    x={plateX} y={plateY} width={plateH} height={plateW}
+                    x={plateX} y={plateY} width={plateWpx} height={plateHpx}
                     rx={4} ry={4}
                     fill={dockFill} stroke={dockStroke} strokeWidth={1.5} opacity={0.55}
                 />
                 {/* Back wall (far edge the robot pushes against) */}
                 <rect
-                    x={wallX} y={cy - wallTall / 2}
-                    width={wallH} height={wallTall}
+                    x={wallX} y={plateY - wallHpx}
+                    width={wallWpx} height={wallHpx}
                     rx={2} ry={2}
-                    fill={mode === "dark" ? "#555" : "#777"} opacity={0.7}
+                    fill={dockStroke} opacity={0.7}
                 />
                 {/* Charging contacts (two copper strips facing the robot) */}
                 <rect
-                    x={contactX} y={cy - contactGap - contactH / 2}
-                    width={contactW} height={contactH}
+                    x={contactLX - contactWpx / 2} y={contactLY - contactHpx / 2}
+                    width={contactWpx} height={contactHpx}
                     rx={1} fill={contactColor} opacity={0.85}
                 />
                 <rect
-                    x={contactX} y={cy + contactGap - contactH / 2}
-                    width={contactW} height={contactH}
+                    x={contactRX - contactWpx / 2} y={contactRY - contactHpx / 2}
+                    width={contactWpx} height={contactHpx}
                     rx={1} fill={contactColor} opacity={0.85}
                 />
                 <text
-                    x={plateX + plateH / 2} y={plateY - 5}
+                    x={cx} y={plateY - 5}
                     textAnchor="middle" fontSize={7}
                     fill={dockLabelColor} fontFamily="monospace"
                 >
@@ -532,20 +574,21 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                 <text
                     x={cx} y={cy + 4}
                     textAnchor="middle" fontSize={9}
-                    fill={mode === "dark" ? "rgba(255,255,255,0.3)" : "rgba(0,0,0,0.25)"}
+                    fill={mode === "dark" ? inkAlpha(0.3) : "rgba(0,0,0,0.25)"}
                     fontFamily="monospace"
                 >
                     base_link
                 </text>
                 <text
-                    x={arrowTip[0] + 6} y={arrowTip[1] + 4}
+                    x={arrowTip[0] - 8} y={arrowTip[1] + 4}
+                    textAnchor="end"
                     fontSize={10} fill={arrowColor} fontFamily="monospace"
                 >
                     +X
                 </text>
             </g>
         );
-    }, [cx, cy, mode, robot]);
+    }, [cx, cy, mode, robot, colors]);
 
     // Draw a single sensor
     const renderSensor = useCallback(
@@ -557,13 +600,23 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
             const isHovered = hoveredSensor === meta.id;
             const sensorColor = mode === "dark" ? meta.colorDark : meta.color;
 
+            // Facing-up frame: a heading yaw θ (CCW from +X/up) points along the
+            // robot vector (cos θ, sin θ) in (X, Y), which projects to the SVG
+            // delta (-sin θ, -cos θ).
             const yawLineLen = 0.06 * SCALE;
-            const yawEndX = sx + Math.cos(val.yaw) * yawLineLen;
-            const yawEndY = sy - Math.sin(val.yaw) * yawLineLen;
+            const yawEndX = sx - Math.sin(val.yaw) * yawLineLen;
+            const yawEndY = sy - Math.cos(val.yaw) * yawLineLen;
 
             const handleDist = 0.08 * SCALE;
-            const handleX = sx + Math.cos(val.yaw) * handleDist;
-            const handleY = sy - Math.sin(val.yaw) * handleDist;
+            const handleX = sx - Math.sin(val.yaw) * handleDist;
+            const handleY = sy - Math.cos(val.yaw) * handleDist;
+
+            // Transparent ≥44px touch target behind the small visible glyph so
+            // dragging works on phones (Apple HIG / Material both call for 44px
+            // minimum tap targets). The visible square/circle stays small.
+            const HIT_R = 24; // 48px diameter
+            const activeStroke = colors.text;
+            const handleFill = mode === "dark" ? colors.bgElevated : colors.bgCard;
 
             return (
                 <g key={meta.id}>
@@ -575,32 +628,35 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                         />
                     )}
 
+                    {/* Invisible drag hit-area (44px+) */}
+                    <circle
+                        cx={sx} cy={sy} r={HIT_R}
+                        fill="transparent"
+                        style={{ cursor: "grab" }}
+                        onMouseDown={(e) => handlePointerDown(meta.id, e)}
+                        onTouchStart={(e) => handlePointerDown(meta.id, e)}
+                        onMouseEnter={() => setHoveredSensor(meta.id)}
+                        onMouseLeave={() => setHoveredSensor(null)}
+                    />
+
                     {meta.shape === "circle" ? (
                         <circle
                             cx={sx} cy={sy} r={sizeInPx}
                             fill={sensorColor}
-                            stroke={isActive ? "#FFF" : sensorColor}
+                            stroke={isActive ? activeStroke : sensorColor}
                             strokeWidth={isActive ? 2 : 1}
                             opacity={0.9}
-                            style={{ cursor: "grab" }}
-                            onMouseDown={(e) => handlePointerDown(meta.id, e)}
-                            onTouchStart={(e) => handlePointerDown(meta.id, e)}
-                            onMouseEnter={() => setHoveredSensor(meta.id)}
-                            onMouseLeave={() => setHoveredSensor(null)}
+                            style={{ cursor: "grab", pointerEvents: "none" }}
                         />
                     ) : (
                         <rect
                             x={sx - sizeInPx} y={sy - sizeInPx}
                             width={sizeInPx * 2} height={sizeInPx * 2} rx={2}
                             fill={sensorColor}
-                            stroke={isActive ? "#FFF" : sensorColor}
+                            stroke={isActive ? activeStroke : sensorColor}
                             strokeWidth={isActive ? 2 : 1}
                             opacity={0.9}
-                            style={{ cursor: "grab" }}
-                            onMouseDown={(e) => handlePointerDown(meta.id, e)}
-                            onTouchStart={(e) => handlePointerDown(meta.id, e)}
-                            onMouseEnter={() => setHoveredSensor(meta.id)}
-                            onMouseLeave={() => setHoveredSensor(null)}
+                            style={{ cursor: "grab", pointerEvents: "none" }}
                         />
                     )}
 
@@ -609,26 +665,36 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                             <line
                                 x1={sx} y1={sy} x2={yawEndX} y2={yawEndY}
                                 stroke={sensorColor} strokeWidth={2}
+                                style={{ pointerEvents: "none" }}
                             />
                             <polygon
                                 points={(() => {
                                     const as = 5;
-                                    const a = val.yaw;
-                                    const p1x = yawEndX + as * Math.cos(Math.PI - a + 0.4);
-                                    const p1y = yawEndY + as * Math.sin(Math.PI - a + 0.4);
-                                    const p2x = yawEndX + as * Math.cos(Math.PI - a - 0.4);
-                                    const p2y = yawEndY + as * Math.sin(Math.PI - a - 0.4);
+                                    // Arrowhead from the on-screen line direction,
+                                    // independent of the frame projection.
+                                    const ang = Math.atan2(yawEndY - sy, yawEndX - sx);
+                                    const p1x = yawEndX - as * Math.cos(ang - 0.4);
+                                    const p1y = yawEndY - as * Math.sin(ang - 0.4);
+                                    const p2x = yawEndX - as * Math.cos(ang + 0.4);
+                                    const p2y = yawEndY - as * Math.sin(ang + 0.4);
                                     return `${yawEndX},${yawEndY} ${p1x},${p1y} ${p2x},${p2y}`;
                                 })()}
                                 fill={sensorColor}
+                                style={{ pointerEvents: "none" }}
                             />
+                            {/* Invisible rotate hit-area (44px+) */}
                             <circle
-                                cx={handleX} cy={handleY} r={6}
-                                fill={mode === "dark" ? "#333" : "#FFF"}
-                                stroke={sensorColor} strokeWidth={2}
+                                cx={handleX} cy={handleY} r={HIT_R}
+                                fill="transparent"
                                 style={{ cursor: "crosshair" }}
                                 onMouseDown={(e) => handleRotateDown(meta.id, e)}
                                 onTouchStart={(e) => handleRotateDown(meta.id, e)}
+                            />
+                            <circle
+                                cx={handleX} cy={handleY} r={6}
+                                fill={handleFill}
+                                stroke={sensorColor} strokeWidth={2}
+                                style={{ cursor: "crosshair", pointerEvents: "none" }}
                             />
                         </>
                     )}
@@ -644,7 +710,7 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                 </g>
             );
         },
-        [cx, cy, dragging, rotating, hoveredSensor, getSensorValue, handlePointerDown, handleRotateDown, mode]
+        [cx, cy, dragging, rotating, hoveredSensor, getSensorValue, handlePointerDown, handleRotateDown, mode, colors]
     );
 
     // Scale labels
@@ -652,18 +718,22 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
         const labels: React.ReactNode[] = [];
         const labelColor = mode === "dark" ? "rgba(255,255,255,0.25)" : "rgba(0,0,0,0.25)";
         const step = 0.10;
+        // Forward (X) axis runs vertically → label down the left margin.
+        // Lateral (Y) axis runs horizontally → label along the bottom margin.
+        const leftX = cx - robot.baseWidth / 2 * SCALE - 12;
+        const bottomY = cy + (robot.baseLength / 2 - robot.chassisCenterX) * SCALE + 18;
         for (let v = -0.3; v <= 0.3 + 0.001; v += step) {
             const r = roundTo(v, 2);
             if (Math.abs(r) < 0.001) continue;
-            const [lx] = toSvg(r, 0, cx, cy);
+            const [, ly] = toSvg(r, 0, cx, cy);
             labels.push(
-                <text key={`xl${r}`} x={lx} y={cy + robot.baseWidth / 2 * SCALE + 20} textAnchor="middle" fontSize={8} fill={labelColor} fontFamily="monospace">
+                <text key={`xl${r}`} x={leftX} y={ly + 3} textAnchor="end" fontSize={8} fill={labelColor} fontFamily="monospace">
                     {r.toFixed(1)}m
                 </text>
             );
-            const [, ly] = toSvg(0, r, cx, cy);
+            const [lx] = toSvg(0, r, cx, cy);
             labels.push(
-                <text key={`yl${r}`} x={cx - robot.baseLength / 2 * SCALE - 10} y={ly + 3} textAnchor="end" fontSize={8} fill={labelColor} fontFamily="monospace">
+                <text key={`yl${r}`} x={lx} y={bottomY} textAnchor="middle" fontSize={8} fill={labelColor} fontFamily="monospace">
                     {r.toFixed(1)}m
                 </text>
             );
@@ -691,25 +761,23 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
             title={
                 <Space>
                     <AimOutlined />
-                    <span>Sensor Placement</span>
+                    <span>{t("robotComponentEditor.sensorPlacement")}</span>
                     <Tag color="blue" style={{ fontSize: 10, marginLeft: 4 }}>
-                        {robot.baseLength.toFixed(2)} x {robot.baseWidth.toFixed(2)} m (from URDF)
+                        {robot.baseLength.toFixed(2)} x {robot.baseWidth.toFixed(2)} {t("robotComponentEditor.metersFromUrdf")}
                     </Tag>
                 </Space>
             }
             style={{ marginBottom: 16 }}
         >
             <Typography.Paragraph type="secondary" style={{ marginBottom: 16 }}>
-                Drag sensors on the top-down robot view to set their X/Y position.
-                Use the rotation handle (small circle) to set sensor yaw.
-                The grid spacing is 5 cm. Robot dimensions are read from the /robot_description topic.
+                {t("robotComponentEditor.dragSensorsHint")}
             </Typography.Paragraph>
 
             <Row gutter={[16, 16]}>
                 <Col xs={24} lg={14}>
                     <div
                         style={{
-                            background: mode === "dark" ? "#1a1a1a" : "#fafafa",
+                            background: mode === "dark" ? colors.bgElevated : colors.bgBase,
                             border: `1px solid ${colors.border}`,
                             borderRadius: 8,
                             display: "flex",
@@ -754,7 +822,7 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                                     </Space>
                                 }
                                 extra={
-                                    <Tooltip title="Reset to defaults">
+                                    <Tooltip title={t("robotComponentEditor.resetToDefaults")}>
                                         <Button type="text" size="small" icon={<UndoOutlined />}
                                             onClick={() => resetSensor(meta)} />
                                     </Tooltip>
@@ -763,7 +831,7 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                             >
                                 <Row gutter={[8, 4]}>
                                     <Col span={12}>
-                                        <Text type="secondary" style={{ fontSize: 11 }}>X (forward)</Text>
+                                        <Text type="secondary" style={{ fontSize: 11 }}>{t("robotComponentEditor.xForward")}</Text>
                                         <InputNumber
                                             value={val.x} onChange={(v) => onChange(meta.xKey, v ?? 0)}
                                             step={0.005} precision={3} size="small"
@@ -771,7 +839,7 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                                         />
                                     </Col>
                                     <Col span={12}>
-                                        <Text type="secondary" style={{ fontSize: 11 }}>Y (left)</Text>
+                                        <Text type="secondary" style={{ fontSize: 11 }}>{t("robotComponentEditor.yLeft")}</Text>
                                         <InputNumber
                                             value={val.y} onChange={(v) => onChange(meta.yKey, v ?? 0)}
                                             step={0.005} precision={3} size="small"
@@ -779,7 +847,7 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                                         />
                                     </Col>
                                     <Col span={12}>
-                                        <Text type="secondary" style={{ fontSize: 11 }}>Z (height)</Text>
+                                        <Text type="secondary" style={{ fontSize: 11 }}>{t("robotComponentEditor.zHeight")}</Text>
                                         <InputNumber
                                             value={val.z} onChange={(v) => onChange(meta.zKey, v ?? 0)}
                                             step={0.005} precision={3} size="small"
@@ -788,7 +856,7 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                                     </Col>
                                     {meta.yawKey && (
                                         <Col span={12}>
-                                            <Text type="secondary" style={{ fontSize: 11 }}>Yaw</Text>
+                                            <Text type="secondary" style={{ fontSize: 11 }}>{t("robotComponentEditor.yaw")}</Text>
                                             {meta.id === "imu" ? (
                                                 <Space.Compact style={{ width: "100%" }}>
                                                     <InputNumber
@@ -797,7 +865,7 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                                                         step={1} precision={1} size="small"
                                                         style={{ width: "100%" }} addonAfter="°"
                                                     />
-                                                    <Tooltip title="Auto-calibrate IMU mounting yaw (robot drives itself ~0.6 m forward then back)">
+                                                    <Tooltip title={t("robotComponentEditor.autoCalibrateImuTooltip")}>
                                                         <Button
                                                             size="small"
                                                             icon={<CompassOutlined />}
@@ -827,15 +895,15 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                         size="small"
                         title={
                             <Space>
-                                <div style={{ width: 12, height: 12, borderRadius: 2, background: mode === "dark" ? "#666" : "#888" }} />
-                                <span>Dock Pose</span>
+                                <div style={{ width: 12, height: 12, borderRadius: 2, background: colors.muted }} />
+                                <span>{t("robotComponentEditor.dockPose")}</span>
                             </Space>
                         }
-                        style={{ marginBottom: 8, borderLeft: `3px solid ${mode === "dark" ? "#666" : "#888"}` }}
+                        style={{ marginBottom: 8, borderLeft: `3px solid ${colors.muted}` }}
                     >
                         <Row gutter={[8, 4]} align="middle">
                             <Col span={12}>
-                                <Text type="secondary" style={{ fontSize: 11 }}>Bearing (compass, 0–360°)</Text>
+                                <Text type="secondary" style={{ fontSize: 11 }}>{t("robotComponentEditor.bearingCompass")}</Text>
                                 <InputNumber
                                     value={roundTo(yawRadToCompassBearing(dockYawRad), 1)}
                                     onChange={(v) => {
@@ -856,13 +924,13 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                                 <div style={{ display: "flex", justifyContent: "center" }}>
                                     <svg width={60} height={60} viewBox="0 0 60 60">
                                         <circle cx={30} cy={30} r={28} fill="none"
-                                            stroke={mode === "dark" ? "#555" : "#ccc"} strokeWidth={1.5} />
+                                            stroke={mode === "dark" ? inkAlpha(0.3) : inkAlpha(0.5)} strokeWidth={1.5} />
                                         {["N", "E", "S", "W"].map((d, i) => {
                                             const a = (i * 90 - 90) * Math.PI / 180;
                                             return (
                                                 <text key={d} x={30 + 22 * Math.cos(a)} y={30 + 22 * Math.sin(a) + 3}
                                                     textAnchor="middle" fontSize={8} fontFamily="monospace"
-                                                    fill={d === "N" ? (mode === "dark" ? "#e55" : "#c00") : (mode === "dark" ? "#999" : "#666")}
+                                                    fill={d === "N" ? colors.danger : colors.textMuted}
                                                 >
                                                     {d}
                                                 </text>
@@ -882,10 +950,10 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                                             return (
                                                 <g>
                                                     <line x1={tailX} y1={tailY} x2={tipX} y2={tipY}
-                                                        stroke={mode === "dark" ? "#4CAF50" : "#2E7D32"}
+                                                        stroke={colors.primary}
                                                         strokeWidth={2.5} strokeLinecap="round" />
                                                     <circle cx={tipX} cy={tipY} r={3}
-                                                        fill={mode === "dark" ? "#4CAF50" : "#2E7D32"} />
+                                                        fill={colors.primary} />
                                                 </g>
                                             );
                                         })()}
@@ -894,47 +962,43 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                             </Col>
                         </Row>
                         <Typography.Paragraph type="secondary" style={{ fontSize: 10, marginTop: 4, marginBottom: 8 }}>
-                            Compass bearing: 0° = N, 90° = E, 180° = S, 270° = W. Hold a
-                            phone compass behind the dock pointing the way the robot enters
-                            and read the bearing off it. Auto-captured on first charge by
-                            dock_yaw_to_set_pose (source: <code>{dockYawSource}</code>).
+                            {t("robotComponentEditor.compassBearingHint")} ({t("robotComponentEditor.source")}: <code>{dockYawSource}</code>).
                         </Typography.Paragraph>
 
                         {/* Capture-from-robot action ─────────────────────── */}
                         <div
                             style={{
-                                borderTop: `1px dashed ${mode === "dark" ? "#444" : "#ddd"}`,
+                                borderTop: `1px dashed ${colors.border}`,
                                 paddingTop: 8,
                                 marginTop: 4,
                             }}
                         >
                             <Typography.Text strong style={{ fontSize: 12 }}>
-                                Capture from current robot position
+                                {t("robotComponentEditor.captureFromRobot")}
                             </Typography.Text>
                             <Typography.Paragraph
                                 type="secondary"
                                 style={{ fontSize: 11, marginTop: 2, marginBottom: 8 }}
                             >
-                                Park the robot on the dock facing the approach direction, then
-                                click below. Captures <strong>x, y AND yaw</strong> at once —
-                                this is the most reliable way to seed the dock pose for a fresh
-                                map.
+                                {t("robotComponentEditor.captureIntro1")}{" "}
+                                <strong>{t("robotComponentEditor.captureXYYaw")}</strong>{" "}
+                                {t("robotComponentEditor.captureIntro2")}
                             </Typography.Paragraph>
                             <Row gutter={[8, 4]} align="middle">
                                 <Col flex="auto">
                                     <Typography.Text type="secondary" style={{ fontSize: 11 }}>
                                         {poseAvailable
-                                            ? `Robot now: x=${roundTo(robotX!, 2)} m, y=${roundTo(robotY!, 2)} m, bearing=${roundTo(yawRadToCompassBearing(robotYaw!), 0)}°`
-                                            : "Waiting for robot pose…"}
+                                            ? t("robotComponentEditor.robotNow", {x: roundTo(robotX!, 2), y: roundTo(robotY!, 2), bearing: roundTo(yawRadToCompassBearing(robotYaw!), 0)})
+                                            : t("robotComponentEditor.waitingForPose")}
                                     </Typography.Text>
                                 </Col>
                                 <Col flex="none">
                                     <Tooltip
                                         title={!isCharging
-                                            ? "Place robot on dock with charging contacts engaged before setting the reference pose"
+                                            ? t("robotComponentEditor.tooltipNotCharging")
                                             : !poseAvailable
-                                                ? "Waiting for robot pose"
-                                                : "Capture the robot's current pose as the canonical dock reference"}
+                                                ? t("robotComponentEditor.tooltipWaitingPose")
+                                                : t("robotComponentEditor.tooltipCapturePose")}
                                     >
                                         {/* span wrapper lets the Tooltip target a disabled Button */}
                                         <span>
@@ -946,7 +1010,7 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                                                 disabled={!poseAvailable || !isCharging}
                                                 onClick={handleSetDockAtRobot}
                                             >
-                                                Set dock pose
+                                                {t("robotComponentEditor.setDockPose")}
                                             </Button>
                                         </span>
                                     </Tooltip>
@@ -956,15 +1020,13 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                     </Card>
 
                     <Typography.Paragraph type="secondary" style={{ fontSize: 11, marginTop: 8 }}>
-                        Coordinates are relative to base_link (centre of rear wheel axis).
-                        X+ = forward, Y+ = left, Z+ = up. Yaw is rotation around Z axis in degrees
-                        (displayed) / radians (stored).
+                        {t("robotComponentEditor.coordinatesHint")}
                     </Typography.Paragraph>
                 </Col>
             </Row>
 
             <Modal
-                title={<Space><CompassOutlined />IMU yaw auto-calibration</Space>}
+                title={<Space><CompassOutlined />{t("robotComponentEditor.imuCalibTitle")}</Space>}
                 open={calibOpen}
                 onCancel={closeCalibration}
                 maskClosable={!calibRunning}
@@ -973,28 +1035,27 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                 destroyOnClose
             >
                 <Typography.Paragraph>
-                    The robot will <strong>drive itself</strong> ~<strong>0.6 m forward</strong>{" "}
-                    and then back to the start, taking roughly <strong>10 seconds</strong>.
+                    {t("robotComponentEditor.imuCalibIntro1")}{" "}
+                    <strong>{t("robotComponentEditor.imuCalibDriveItself")}</strong> ~<strong>{t("robotComponentEditor.imuCalibForward")}</strong>{" "}
+                    {t("robotComponentEditor.imuCalibIntro2")}{" "}
+                    <strong>{t("robotComponentEditor.imuCalibTenSeconds")}</strong>.
                     <ul style={{ marginTop: 8, marginBottom: 4 }}>
-                        <li>Make sure the robot is <strong>undocked</strong> (it refuses to run while charging).</li>
-                        <li>Leave <strong>at least 1 m</strong> of clear space in front and behind.</li>
-                        <li>Any active emergency must be cleared first.</li>
+                        <li>{t("robotComponentEditor.imuCalibBullet1a")} <strong>{t("robotComponentEditor.imuCalibUndocked")}</strong> {t("robotComponentEditor.imuCalibBullet1b")}</li>
+                        <li>{t("robotComponentEditor.imuCalibBullet2a")} <strong>{t("robotComponentEditor.imuCalibAtLeast1m")}</strong> {t("robotComponentEditor.imuCalibBullet2b")}</li>
+                        <li>{t("robotComponentEditor.imuCalibBullet3")}</li>
                     </ul>
-                    Collision monitor stays armed — obstacles will stop the motion.
+                    {t("robotComponentEditor.imuCalibCollisionMonitor")}
                 </Typography.Paragraph>
                 <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
-                    Estimates the mounting yaw of the IMU chip relative to base_link by
-                    comparing the horizontal accelerometer vector to the wheel-odometry
-                    body-frame acceleration during the forward and backward ramps.
-                    Only samples with |wz| &lt; 0.05 rad/s and |a_body| &gt; 0.1 m/s² are used.
+                    {t("robotComponentEditor.imuCalibTechnical")}
                 </Typography.Paragraph>
 
                 {!calibResult && !calibRunning && (
                     <div style={{ textAlign: "right", marginTop: 16 }}>
                         <Space>
-                            <Button onClick={closeCalibration}>Cancel</Button>
+                            <Button onClick={closeCalibration}>{t("robotComponentEditor.cancel")}</Button>
                             <Button type="primary" icon={<CompassOutlined />} onClick={startCalibration}>
-                                Start
+                                {t("robotComponentEditor.start")}
                             </Button>
                         </Space>
                     </div>
@@ -1004,8 +1065,8 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                     <Alert
                         type="info"
                         showIcon
-                        message="Calibration running — robot is driving itself"
-                        description="Forward leg, pause, backward leg. Stand clear. The motion will stop automatically."
+                        message={t("robotComponentEditor.calibRunningMessage")}
+                        description={t("robotComponentEditor.calibRunningDescription")}
                         style={{ marginTop: 8 }}
                     />
                 )}
@@ -1019,11 +1080,10 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                                 message={`imu_yaw = ${calibResult.imu_yaw_deg.toFixed(2)}° (${calibResult.imu_yaw_rad.toFixed(4)} rad)`}
                                 description={
                                     <>
-                                        Confidence ±{calibResult.std_dev_deg.toFixed(2)}° from{" "}
-                                        {calibResult.samples_used} valid samples.
+                                        {t("robotComponentEditor.calibConfidence", {dev: calibResult.std_dev_deg.toFixed(2), samples: calibResult.samples_used})}
                                         <br />
                                         <Typography.Text type="secondary">
-                                            Current value: {roundTo(radToDeg(values.imu_yaw ?? 0), 2)}°
+                                            {t("robotComponentEditor.calibCurrentValue", {value: roundTo(radToDeg(values.imu_yaw ?? 0), 2)})}
                                         </Typography.Text>
                                     </>
                                 }
@@ -1032,14 +1092,13 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                             <Alert
                                 type="error"
                                 showIcon
-                                message="Calibration failed"
+                                message={t("robotComponentEditor.calibFailed")}
                                 description={
                                     <>
                                         {calibResult.message}
                                         <br />
                                         <Typography.Text type="secondary">
-                                            Hint: drive faster or longer so the accelerometer sees a
-                                            clear forward and backward impulse along the body X axis.
+                                            {t("robotComponentEditor.calibFailedHint")}
                                         </Typography.Text>
                                     </>
                                 }
@@ -1047,11 +1106,11 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
                         )}
                         <div style={{ textAlign: "right", marginTop: 16 }}>
                             <Space>
-                                <Button onClick={() => { resetCalibration(); }}>Retry</Button>
-                                <Button onClick={closeCalibration}>Discard</Button>
+                                <Button onClick={() => { resetCalibration(); }}>{t("robotComponentEditor.retry")}</Button>
+                                <Button onClick={closeCalibration}>{t("robotComponentEditor.discard")}</Button>
                                 {calibResult.success && (
                                     <Button type="primary" onClick={applyCalibration}>
-                                        Apply
+                                        {t("robotComponentEditor.apply")}
                                     </Button>
                                 )}
                             </Space>

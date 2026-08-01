@@ -28,6 +28,7 @@
 
 #include "geometry_msgs/msg/point32.hpp"
 #include "mowgli_interfaces/msg/emergency.hpp"
+#include "mowgli_interfaces/msg/high_level_status.hpp"
 #include "mowgli_interfaces/msg/power.hpp"
 #include "mowgli_interfaces/msg/status.hpp"
 #include "nav_msgs/msg/path.hpp"
@@ -67,6 +68,29 @@ struct BTContext
 
   /// Mutex protecting fields written by subscriber callbacks and read by
   /// BT condition/action nodes.  Use std::lock_guard for RAII locking.
+  ///
+  /// Does NOT cover the coverage-tracking fields below (command state +
+  /// swath-completion model: target_area_index, attempted_areas,
+  /// area_attempt_count, area_last_coverage, area_completed_swaths,
+  /// area_swath_count, area_resume_pose_index, area_path_pose_count,
+  /// area_plan_fingerprint, completed_areas, coverage_all_complete). Those
+  /// are mutated ONLY from this node's own BT action-node callbacks
+  /// (FollowStrip, GetNextUnmowedArea, EndSession) and the deferred
+  /// ~/clear_coverage_resume handling in tickTree() — every callback of
+  /// behavior_tree_node shares its default MutuallyExclusive callback group,
+  /// so the tick thread and every service/timer callback are already
+  /// serialized against each other even under the MultiThreadedExecutor (see
+  /// behavior_tree_node.cpp's ~/clear_coverage_resume comment for the full
+  /// rationale). Locking context_mutex around them is therefore redundant —
+  /// and 2026-07-17 (task #15) was actively HARMFUL: GetNextUnmowedArea was
+  /// the one place still taking it inconsistently, which is what produced
+  /// the non-recursive-mutex deadlock documented at
+  /// GetNextUnmowedArea::processResponse (advanceAndProbe() re-locking from
+  /// inside an already-held lock). Do not add locking back here without
+  /// first re-deriving why the MutuallyExclusive guarantee no longer holds
+  /// (e.g. a future Reentrant-group conversion) — see the atomic-future-
+  /// proofing note on behavior_tree_node's clear_resume_requested_ for the
+  /// pattern to follow instead of a mutex if that ever happens.
   mutable std::mutex context_mutex;
 
   // -----------------------------------------------------------------------
@@ -116,6 +140,64 @@ struct BTContext
   static constexpr float kAreaProgressEpsilonPct = 0.5f;
 
   // -----------------------------------------------------------------------
+  // Swath-completion model (replaces the mow_progress cell grid)
+  // -----------------------------------------------------------------------
+  /// Indices of swaths already mowed for each area, in the deterministic F2C
+  /// swath order. FollowStrip inserts a swath index once its FollowPath goal
+  /// succeeds; on a re-plan (resume after recharge / preempt) it skips any
+  /// index already present. F2C is deterministic for a fixed area+params, so
+  /// indices are stable across re-plans within a session. Persisted with the
+  /// area set so resume survives a restart. Cleared per area by EndSession /
+  /// a coverage reset.
+  std::map<uint32_t, std::set<std::size_t>> area_completed_swaths;
+  /// Total swath count for each area, set by FollowStrip after segmenting the
+  /// planned path. 0 until the area has been planned at least once.
+  std::map<uint32_t, std::size_t> area_swath_count;
+  /// Resume cursor: the furthest pose index reached along the area's CONTINUOUS
+  /// full_path. FollowStrip drives the plan as one continuous path, so the
+  /// per-segment "completed swath index" model can only ever record index 0 (on
+  /// full completion). Without this cursor, an interruption mid-path (recharge,
+  /// preempt, controller abort) restarts the WHOLE path from the beginning, an
+  /// area needing >1 charge never finishes, and a single abort that made real
+  /// progress used to fail/abandon the area. FollowStrip persists the furthest
+  /// reached index here on abort/halt and, on re-dispatch, trims the already-
+  /// driven prefix so it resumes near where it stopped. F2C is deterministic for
+  /// a fixed area+params, so the re-planned path is identical and the index is
+  /// stable. Cleared (erased) when the area completes; reset by EndSession.
+  std::map<uint32_t, std::size_t> area_resume_pose_index;
+  /// Total pose count of the area's continuous full_path (the denominator for
+  /// the resume-cursor coverage_percent). Set by FollowStrip at dispatch.
+  std::map<uint32_t, std::size_t> area_path_pose_count;
+  /// Plan-GEOMETRY fingerprint of the area's freshly-planned drivable units
+  /// (hash of every unit's quantized pose positions + per-unit counts). This is
+  /// the resume-cursor STALENESS key: the pose COUNT alone is not sufficient
+  /// because the AUTO mow-angle tie-break (longest-edge, coverage_planning.cpp)
+  /// or the sub-path split can yield a geometrically DIFFERENT concatenation with
+  /// the SAME pose count — resuming a cursor against that different geometry would
+  /// re-enable the blade at the wrong location. On re-plan, FollowStrip discards
+  /// the persisted resume state when this fingerprint no longer matches. Set at
+  /// dispatch; persisted with the area row; cleared with the other resume maps.
+  std::map<uint32_t, uint64_t> area_plan_fingerprint;
+  /// Areas whose every swath is completed-or-skipped this session. Skipped by
+  /// GetNextUnmowedArea. Cleared by EndSession.
+  std::set<uint32_t> completed_areas;
+  /// Filesystem path the coverage RESUME state (the four maps above +
+  /// completed_areas + current_area) is persisted to, so an interrupted session
+  /// survives a full process/container restart — not just the in-RAM BT
+  /// halt/resume. Set from the `coverage_resume_path` parameter at startup;
+  /// empty disables disk persistence. Written on every interruption / swath
+  /// completion, loaded once at node startup, and removed by EndSession. See
+  /// coverage_persistence.{hpp,cpp}.
+  std::string coverage_resume_path;
+  /// True when GetNextUnmowedArea exhausted the area list because every area is
+  /// genuinely DONE (not because of a transient service error / timeout / no
+  /// areas defined). The coverage subtree reads this (IsCoverageComplete) to
+  /// route a normal finish to the MOWING_COMPLETE terminal instead of the
+  /// COVERAGE_FAILED_DOCKING path. Reset to false at the start of each
+  /// GetNextUnmowedArea run so a transient failure never masquerades as done.
+  bool coverage_all_complete{false};
+
+  // -----------------------------------------------------------------------
   // Derived / convenience fields (computed from latest_* messages)
   // -----------------------------------------------------------------------
 
@@ -130,10 +212,13 @@ struct BTContext
   // GPS quality classification (derived from gps_quality / fix_type)
   // -----------------------------------------------------------------------
 
-  /// GPS fix type: 0=no fix, 1=autonomous, 2=DGPS, 4=RTK fixed, 5=RTK float
+  /// Quality-monotonic GPS fix type derived from /gps/status:
+  /// 0=no fix, 2=generic GNSS fix, 3=RTK float, 4=RTK fixed.
   uint8_t gps_fix_type{0};
 
-  /// true when RTK fixed (fix_type >= 4 and gps_quality > 80%)
+  /// True when the authoritative /gps/status contract reports a stable RTK-fixed
+  /// state at high confidence. SeedYawFromMotion and preflight RTK gates read
+  /// this instead of inferring fix quality from /gps/absolute_pose covariance.
   bool gps_is_fixed{false};
 
   // -----------------------------------------------------------------------
@@ -156,10 +241,19 @@ struct BTContext
   /// Current navigation mode: "precise" or "degraded"
   std::string current_nav_mode{"precise"};
 
+  /// Whether SetNav2Lifecycle has suspended (PAUSEd) the Nav2 lifecycle
+  /// stack to save CPU/thermal budget while idle on the dock. Tracked here
+  /// (rather than re-querying lifecycle_manager every tick) so the
+  /// SetNav2Lifecycle RESUME/PAUSE nodes only issue a manage_nodes service
+  /// call on an actual state transition — the BT is the sole pause/resume
+  /// authority. Only meaningful when the idle_nav2_suspend feature flag is
+  /// enabled; stays false otherwise. Protected by context_mutex.
+  bool nav2_suspended{false};
+
   /// Operator-configured drive speeds (m/s), sourced from mowgli_robot.yaml
   /// by behavior_tree_node and applied to the live controllers by SetNavMode:
   /// transit_speed → FollowPath.desired_linear_vel (RPP transit), mowing_speed
-  /// → FollowCoveragePath.speed_fast (FTC coverage). Defaults match the shipped
+  /// → FollowCoveragePath.vx_max (MPPI coverage). Defaults match the shipped
   /// template; SetNavMode halves them in "degraded" mode (floored at the host
   /// min-drive clamp).
   double transit_speed{0.25};
@@ -215,6 +309,16 @@ struct BTContext
   /// flags "not currently in STOP".
   std::chrono::steady_clock::time_point collision_stop_since{};
 
+  /// Arrival time of the most recent /collision_monitor_state message —
+  /// ANY action_type. collision_monitor only processes (and republishes
+  /// state) while cmd_vel_nav flows; once the tree halts, the stream goes
+  /// silent and collision_action_type is a STALE LATCH, not live state.
+  /// Field 2026-07-23: the first SensorSafetyGuard deployment deadlocked on
+  /// exactly this — guard halts tree → Nav2 stops publishing → monitor stops
+  /// publishing → STOP latched forever → guard never releases (268 s observed).
+  /// Consumers MUST treat a stale latch as "unknown", not "still stopped".
+  std::chrono::steady_clock::time_point last_collision_state_time{};
+
   /// Time of the most recent STOP→non-STOP transition. Default-constructed
   /// = no STOP has ever ended this session. Used by WasRecentlyInCollisionStop
   /// so transient obstacles that clear between FollowStrip retry attempts
@@ -230,6 +334,14 @@ struct BTContext
   /// the BackUp + costmap clear is still settling.
   std::chrono::steady_clock::time_point last_obstacle_backoff_time{};
 
+  /// Scan-stream liveness (SAFETY_REVIEW_2026-07-23 A-C2). Stamped by the
+  /// /scan_collision subscriber in behavior_tree_node on every message.
+  /// Default-constructed = no scan EVER received this session — IsScanStale
+  /// treats that as "no LiDAR install" and stays inert, so no lidar_enabled
+  /// plumbing is needed: the guard only arms once a real scan stream has
+  /// existed and then died (LiDAR container crash, filter-chain death).
+  std::chrono::steady_clock::time_point last_scan_time{};
+
   // -----------------------------------------------------------------------
   // Per-session flags reset by ClearCommand at session end
   // -----------------------------------------------------------------------
@@ -241,6 +353,26 @@ struct BTContext
   /// halts MowingSequence (e.g., BoundaryGuard or GpsMode transition) and
   /// later re-enters it from the top.
   bool yaw_seeded_this_session{false};
+
+  // -----------------------------------------------------------------------
+  // Docking transit lifecycle (owned by the DockRobot action node)
+  // -----------------------------------------------------------------------
+
+  /// True while a DockRobot action is actively running (between onStart's
+  /// RUNNING return and its terminal SUCCESS/FAILURE or a parent halt).
+  /// Maintained SOLELY by DockRobot (onStart sets true, onRunning clears on
+  /// any terminal status, onHalted clears unconditionally) so the flag can
+  /// never stick true — BehaviorTree.CPP guarantees onHalted() is invoked
+  /// whenever a RUNNING StatefulActionNode is halted by a parent.
+  ///
+  /// Consumed by IsDocking, which BoundaryGuard uses to EXEMPT the blade-off
+  /// dock transit (command 1) from the SoftBoundaryHandler: every DockRobot
+  /// is entered only after SetMowerEnabled(false) and can never overlap the
+  /// blade-on FollowStrip subtree, so "docking_active under command 1" is
+  /// provably a blade-OFF transit — the boundary handler must NOT cancel it.
+  /// Blade-ON mowing (FollowStrip) keeps full boundary protection because
+  /// docking_active is false there. See main_tree.xml BoundaryGuard.
+  bool docking_active{false};
 
   // -----------------------------------------------------------------------
   // Docking point (set from parameter or service call)
@@ -273,36 +405,37 @@ struct BTContext
   std::vector<geometry_msgs::msg::Point> visited_waypoints;
 
   // -----------------------------------------------------------------------
-  // Cell-based strip coverage state
+  // Swath-segmented coverage state
   // -----------------------------------------------------------------------
 
-  /// Current strip / segment path to mow. Populated by GetNextStrip
-  /// (legacy) or GetNextSegment (Path C cell-based coverage), consumed
-  /// by FollowStrip and MarkSegmentBlocked.
+  /// Full-area coverage path — the concatenation of all segments, kept for
+  /// the GUI/Foxglove full-plan view and empty-checks. Populated by
+  /// PlanCoverageArea. Execution uses current_strip_segments, NOT this.
   nav_msgs::msg::Path current_strip_path;
 
-  /// Transit goal to reach strip / segment start (populated by
-  /// GetNextStrip or GetNextSegment, consumed by TransitToStrip).
+  /// EXPLICIT ordered coverage segments from the coverage server (headland
+  /// rings first, then straight serpentine swaths). Populated by
+  /// PlanCoverageArea; FollowStrip dispatches ONE segment per
+  /// FollowCoveragePath goal (RotationShim pivots in place at each segment
+  /// start, MPPI tracks the straight swath / smooth ring). Replaces the
+  /// heading-jump re-segmentation heuristic, which silently failed on smooth
+  /// turn arcs (field 2026-06-12: one 3982-pose "swath").
+  std::vector<nav_msgs::msg::Path> current_strip_segments;
+
+  /// Hole-free continuous SUB-PATHS from the coverage server (issue #333), in
+  /// drive order. A forward turn-around connector can't route around a large
+  /// interior obstacle, so the continuous path is split where it would cross a
+  /// hole; FollowStrip drives each sub-path with MPPI and bridges the gap
+  /// between consecutive sub-paths with a blade-off, costmap-aware Nav2 transit
+  /// (its existing >kSegmentTransitGap behaviour) that routes around the
+  /// obstacle. Exactly ONE entry for a hole-free field (== current_strip_path).
+  /// When present, FollowStrip drives THESE (one FollowCoveragePath goal per
+  /// sub-path) instead of the single current_strip_path.
+  std::vector<nav_msgs::msg::Path> current_strip_subpaths;
+
+  /// Transit goal to reach the coverage path start (populated by
+  /// PlanCoverageArea, consumed by TransitToStrip).
   geometry_msgs::msg::PoseStamped current_transit_goal;
-
-  /// Path C: true when the current segment requires transit
-  /// (>~0.5 m gap or large turn) so the BT must disengage the blade
-  /// before the move and re-engage at the start of the next FollowStrip.
-  /// false → blade stays on for a continuous mowing flow between
-  /// adjacent segments. Updated by GetNextSegment; read by the
-  /// IsShortSegment condition node in the BT XML.
-  bool current_segment_is_long_transit{false};
-
-  /// Path C: free-form tag set by GetNextSegment for diagnostics
-  /// ("interior" / "transit" / "complete").
-  std::string current_segment_phase{};
-
-  /// Path C: termination reason returned by the segment selector for
-  /// the current segment ("boundary" / "obstacle" / "dead_zone" /
-  /// "max_length" / "row_end"). Used by MarkSegmentBlocked decisions —
-  /// e.g. don't bump fail_count when the segment ended at a known
-  /// "obstacle" because that's not a robot failure.
-  std::string current_segment_termination_reason{};
 
   /// Latest coverage percentage.
   float coverage_percent{0.0f};
@@ -315,6 +448,21 @@ struct BTContext
   int total_swaths{0};
   int completed_swaths{0};
   int skipped_swaths{0};
+
+  // -----------------------------------------------------------------------
+  // High-level status publishing (shared publisher + last-published cache)
+  // -----------------------------------------------------------------------
+  // PublishHighLevelStatus is a SyncActionNode that only ticks on tree
+  // transitions, so during a multi-minute FollowStrip (which sits RUNNING with
+  // no transitions) the topic goes SILENT for the whole traversal. The
+  // publisher is volatile and the GUI frontend starts from an empty status and
+  // only updates on live messages, so a dashboard opened/refreshed mid-mow
+  // receives nothing and renders "idle". To keep the topic fresh, the publisher
+  // is owned here and the behavior_tree_node re-publishes last_high_level_status
+  // on a periodic timer. Protected by context_mutex.
+  rclcpp::Publisher<mowgli_interfaces::msg::HighLevelStatus>::SharedPtr high_level_status_pub;
+  mowgli_interfaces::msg::HighLevelStatus last_high_level_status;
+  bool has_high_level_status{false};
 
   // -----------------------------------------------------------------------
   // TF buffer (shared across all BT nodes)

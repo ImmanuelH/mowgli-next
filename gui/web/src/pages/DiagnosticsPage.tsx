@@ -11,6 +11,7 @@ import {
     Row,
     Space,
     Statistic,
+    Switch,
     Table,
     Tabs,
     Tag,
@@ -18,15 +19,23 @@ import {
 } from "antd";
 import {
     ApiOutlined,
+    CheckCircleOutlined,
+    CloseCircleOutlined,
     CloudServerOutlined,
     CompassOutlined,
     DashboardOutlined,
+    DeleteOutlined,
+    DownloadOutlined,
+    PlayCircleOutlined,
     ReloadOutlined,
+    SettingOutlined,
     SoundOutlined,
+    StopOutlined,
     ThunderboltOutlined,
+    VideoCameraOutlined,
     WarningOutlined,
-    WifiOutlined,
 } from "@ant-design/icons";
+import {ContentType} from "../api/Api.ts";
 import {useHighLevelStatus} from "../hooks/useHighLevelStatus.ts";
 import {useEmergency} from "../hooks/useEmergency.ts";
 import {usePower} from "../hooks/usePower.ts";
@@ -34,7 +43,7 @@ import {useStatus} from "../hooks/useStatus.ts";
 import {useGPS} from "../hooks/useGPS.ts";
 import {useGnssStatus} from "../hooks/useGnssStatus.ts";
 import {useFusionOdom} from "../hooks/useFusionOdom.ts";
-import {useBTLog} from "../hooks/useBTLog.ts";
+import {useBTLog, isBTNodeStale} from "../hooks/useBTLog.ts";
 import {useImu} from "../hooks/useImu.ts";
 import {useCogHeading} from "../hooks/useCogHeading.ts";
 import {useMagYaw} from "../hooks/useMagYaw.ts";
@@ -47,53 +56,80 @@ import {useDiagnostics} from "../hooks/useDiagnostics.ts";
 import {useThemeMode} from "../theme/ThemeContext.tsx";
 import {useIsMobile} from "../hooks/useIsMobile";
 import {
+    displayHorizontalAccuracyM,
     deriveGpsStatus,
-    gnssReceiverLabel,
-    hasGnssCapability,
-    readGnssBooleanState,
-    readGnssNumber,
 } from "../utils/gpsStatus.ts";
 import {useEffect, useMemo, useState} from "react";
+import {App} from "antd";
+import {useTranslation} from "react-i18next";
 import {useSettings} from "../hooks/useSettings.ts";
-import {computeBatteryPercent} from "../utils/battery.ts";
+import {computeBatteryPercent, getBatteryLevel} from "../utils/battery.ts";
+import {yawFromQuaternion, rollFromQuaternion, pitchFromQuaternion, wrapDeg180} from "../utils/quaternion.ts";
 import {useApi} from "../hooks/useApi.ts";
 import {useFusionGraphDiagnostics} from "../hooks/useFusionGraphDiagnostics.ts";
+import {useRosbag, RosbagRecording} from "../hooks/useRosbag.ts";
+import {useFirmwareDebugLogs} from "../hooks/useFirmwareDebugLogs.ts";
 import {useMowerAction} from "../components/MowerActions.tsx";
+import {useImuYawCalibration} from "../hooks/useImuYawCalibration.ts";
+import {AsyncButton} from "../components/AsyncButton.tsx";
+import {TelemetryStat} from "../components/TelemetryStat.tsx";
 import {BTStateGraph} from "../components/BTStateGraph.tsx";
 import {RobotAnatomy} from "../components/RobotAnatomy.tsx";
-import {GnssStatusConstants} from "../types/ros.ts";
 import {AlertOutlined} from "@ant-design/icons";
+import {DashCard} from "../components/dashboard/Card.tsx";
+import {GnssLiveDiagnosticsCard} from "../components/gnss/GnssLiveDiagnosticsCard.tsx";
+import {clampTinyToZero} from "../utils/telemetryFormat.ts";
+import {detectNav2Recovery} from "../utils/nav2Recovery.ts";
+import {groupAlertsByComponent} from "../utils/diagnosticsAlerts.ts";
+import {useValueSince} from "../hooks/useValueSince.ts";
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-function yawFromQuaternion(x = 0, y = 0, z = 0, w = 1): number {
-    return Math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)) * (180 / Math.PI);
-}
-
-function rollFromQuaternion(x = 0, y = 0, z = 0, w = 1): number {
-    return Math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y)) * (180 / Math.PI);
-}
-
-function pitchFromQuaternion(x = 0, y = 0, z = 0, w = 1): number {
-    const sinp = 2 * (w * y - z * x);
-    return Math.abs(sinp) >= 1 ? (Math.sign(sinp) * 90) : Math.asin(sinp) * (180 / Math.PI);
+function formatBytes(bytes: number): string {
+    if (!bytes || bytes < 0) return "0 B";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let value = bytes;
+    let i = 0;
+    while (value >= 1024 && i < units.length - 1) {
+        value /= 1024;
+        i++;
+    }
+    return `${value.toFixed(value >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
 function secondsAgo(timestamp: string): number {
     return Math.floor((Date.now() - new Date(timestamp).getTime()) / 1000);
 }
 
+// Client timeout for the magnetometer calibration POST — it drives the robot
+// through a rotation, so give it a generous budget then abort.
+const MAG_CALIB_CLIENT_TIMEOUT_MS = 120_000;
+
+// A Nav2 recovery persisting this long means the robot is not making
+// progress — surface it in the health verdict as "possibly stuck".
+const NAV2_RECOVERY_STUCK_MS = 120_000;
+
+// HighLevelStatus.state value for autonomous (mowing) operation.
+const HIGH_LEVEL_STATE_AUTONOMOUS = 2;
+
 const DIAG_LEVEL_COLORS: Record<number, string> = {0: "success", 1: "warning", 2: "error", 3: "default"};
-const DIAG_LEVEL_LABELS: Record<number, string> = {0: "OK", 1: "WARN", 2: "ERROR", 3: "STALE"};
+// Labels resolve through t(...) at render time (module-level: no hook here).
+const DIAG_LEVEL_LABEL_KEYS: Record<number, string> = {
+    0: "diagnosticsPage.diagLevelOk",
+    1: "diagnosticsPage.diagLevelWarn",
+    2: "diagnosticsPage.diagLevelError",
+    3: "diagnosticsPage.diagLevelStale",
+};
 
 // ESC status codes from mowgli_interfaces/msg/ESCStatus.msg
-const ESC_STATUS: Record<number, {label: string; color: string}> = {
-    0:   {label: "Off", color: "default"},
-    99:  {label: "Disconnected", color: "warning"},
-    100: {label: "Error", color: "error"},
-    150: {label: "Stalled", color: "error"},
-    200: {label: "OK", color: "success"},
-    201: {label: "Running", color: "success"},
+// labelKey resolves through t(...) at render time (module-level: no hook here).
+const ESC_STATUS: Record<number, {labelKey: string; color: string}> = {
+    0:   {labelKey: "diagnosticsPage.escOff", color: "default"},
+    99:  {labelKey: "diagnosticsPage.escDisconnected", color: "warning"},
+    100: {labelKey: "diagnosticsPage.escError", color: "error"},
+    150: {labelKey: "diagnosticsPage.escStalled", color: "error"},
+    200: {labelKey: "diagnosticsPage.escOk", color: "success"},
+    201: {labelKey: "diagnosticsPage.escRunning", color: "success"},
 };
 
 // ── sub-components ───────────────────────────────────────────────────────────
@@ -102,10 +138,22 @@ function HealthBadge({label, color}: {label: string; color: string}) {
     return <Tag color={color} style={{fontSize: 12, padding: "2px 8px"}}>{label}</Tag>;
 }
 
+// A Tag whose color is not the sole signal: the label text never changes
+// (e.g. "ESC power"), so pair it with a check/cross icon whose SHAPE (not
+// just color) carries the on/off state for color-blind / low-vision users.
+function BoolStatusTag({label, ok}: {label: string; ok: boolean}) {
+    return (
+        <Tag color={ok ? "success" : "default"} icon={ok ? <CheckCircleOutlined/> : <CloseCircleOutlined/>}>
+            {label}
+        </Tag>
+    );
+}
+
 // ── main page ────────────────────────────────────────────────────────────────
 
 export const DiagnosticsPage = () => {
     const {colors} = useThemeMode();
+    const {t} = useTranslation();
     const isMobile = useIsMobile();
 
     const {highLevelStatus} = useHighLevelStatus();
@@ -121,7 +169,7 @@ export const DiagnosticsPage = () => {
     const {imu: magImu, lastMessageAt: magLastAt} = useMagYaw();
     const wheelOdom = useWheelOdom();
     const wheelTicks = useWheelTicks();
-    const {status: calibrationStatus, refresh: refreshCalibration} = useCalibrationStatus();
+    const {status: calibrationStatus, error: calibrationError, refresh: refreshCalibration} = useCalibrationStatus();
 
     // Tick state once a second so the "Live/Stale" tags update even when no
     // new message has arrived (staleness is time-based, not message-driven).
@@ -130,10 +178,14 @@ export const DiagnosticsPage = () => {
         const id = setInterval(() => setNowMs(Date.now()), 1000);
         return () => clearInterval(id);
     }, []);
-    const {snapshot, loading, refresh} = useDiagnosticsSnapshot();
+    const {modal} = App.useApp();
+    const {snapshot, loading, error: snapshotError, refresh} = useDiagnosticsSnapshot();
     const {diagnostics} = useDiagnostics();
     const {settings} = useSettings();
+    const guiApi = useApi();
     const wheelRpm = useWheelRpm({wheelRadiusM: settings?.wheel_radius ?? 0.04475});
+    const {stats: fusionStats} = useFusionGraphDiagnostics();
+    const rosbag = useRosbag(true);
 
     // ── derived values ───────────────────────────────────────────────────────
 
@@ -144,7 +196,6 @@ export const DiagnosticsPage = () => {
 
     const gpsFix = useMemo(() => deriveGpsStatus(gnssStatus), [gnssStatus]);
     const gpsFixType = gpsFix.label;
-    const gpsReceiver = gnssReceiverLabel(gnssStatus);
 
     const orientation = pose.pose?.pose?.orientation;
     const qx = orientation?.x ?? 0;
@@ -157,11 +208,7 @@ export const DiagnosticsPage = () => {
     const poseZ = pose.pose?.pose?.position?.z ?? 0;
 
     const allContainersOk = !snapshot?.containers?.length || snapshot.containers.every(c => c.state === "running");
-    const gpsAccuracy = readGnssNumber(
-        gnssStatus,
-        GnssStatusConstants.CAP_HORIZONTAL_ACCURACY,
-        gnssStatus.horizontal_accuracy_m,
-    );
+    const gpsAccuracy = displayHorizontalAccuracyM(gnssStatus);
     const gpsFixValid = gnssStatus.fix_valid ?? false;
     const gpsOk = gpsFixValid && gpsAccuracy !== undefined && gpsAccuracy <= 0.1;
     const gpsWarn = gpsFixValid && (gpsAccuracy === undefined || gpsAccuracy > 0.1);
@@ -175,31 +222,116 @@ export const DiagnosticsPage = () => {
         ),
         [diagnostics.status]
     );
+    const alertGroups = useMemo(() => groupAlertsByComponent(alerts), [alerts]);
+
+    // Nav2 recovery tracking (from /behavior_tree_log — Nav2's tree, not the
+    // Mowgli BT). A long-running recovery is the "robot is stuck" signal.
+    const nav2Recovery = useMemo(() => detectNav2Recovery(btNodeStates, nowMs), [btNodeStates, nowMs]);
+    const recoverySince = useValueSince(nav2Recovery.active);
+    const recoveryDurationMs = recoverySince !== null ? nowMs - recoverySince : 0;
+    const recoveryStuck = nav2Recovery.active && recoveryDurationMs > NAV2_RECOVERY_STUCK_MS;
+
+    // Time in the current high-level state ("MOWING · 12 min").
+    const stateSince = useValueSince(highLevelStatus.state_name);
+    const formatDuration = (ms: number): string => {
+        const totalSec = Math.max(0, Math.floor(ms / 1000));
+        return totalSec >= 60
+            ? t('diagnosticsPage.durationMin', {minutes: Math.floor(totalSec / 60)})
+            : t('diagnosticsPage.durationSec', {seconds: totalSec});
+    };
+    const stateSinceLabel = stateSince !== null ? formatDuration(nowMs - stateSince) : undefined;
+
+    // ── Health Verdict Hero ──────────────────────────────────────────────────
+    // A single beginner-readable tile derived from the same booleans the
+    // expert health bar uses. Emergency (or a stopped container / no GPS) is
+    // "Urgence"; a soft warning (RTK-Float, warm CPU, low battery) is
+    // "Attention requise"; otherwise "Tout va bien".
+
+    const cpuHot = cpuTemp > 70;
+    const cpuWarm = cpuTemp > 55 && cpuTemp <= 70;
+    const batteryLevel = getBatteryLevel(batteryPercent);
+    const batteryLow = batteryLevel === "danger";
+    const batteryMid = batteryLevel === "warn";
+
+    // The emergency signal proper — only this drives the big "Emergency"
+    // wording. Other danger causes (low battery, hot CPU, stopped container,
+    // no GPS) surface as "Critical".
+    const emergencyActive = (emergency.active_emergency ?? highLevelStatus.emergency) ?? false;
+
+    const healthLevel: "ok" | "warn" | "danger" =
+        emergencyActive || !allContainersOk || (!gpsOk && !gpsWarn) || cpuHot || batteryLow
+            ? "danger"
+            : gpsWarn || cpuWarm || batteryMid || recoveryStuck || alerts.length > 0
+                ? "warn"
+                : "ok";
+
+    const healthVerdict =
+        healthLevel === "danger"
+            ? (emergencyActive ? t('diagnosticsPage.verdictEmergency') : t('diagnosticsPage.verdictCritical'))
+            : healthLevel === "warn"
+                ? (recoveryStuck ? t('diagnosticsPage.verdictStuck') : t('diagnosticsPage.verdictAttention'))
+                : t('diagnosticsPage.verdictAllGood');
+
+    const healthColor =
+        healthLevel === "danger" ? colors.danger :
+        healthLevel === "warn" ? colors.warning :
+        colors.primary;
+
+    const healthSubtitle = emergencyActive
+        ? t('diagnosticsPage.subtitleEmergency')
+        : !allContainersOk
+            ? t('diagnosticsPage.subtitleContainerStopped')
+            : healthLevel === "danger"
+                ? t('diagnosticsPage.subtitleOutOfRange')
+                : recoveryStuck
+                    ? t('diagnosticsPage.subtitleRecoveryStuck', {duration: formatDuration(recoveryDurationMs)})
+                    : gpsWarn || cpuWarm || batteryMid
+                        ? t('diagnosticsPage.subtitleWatch')
+                        : alerts.length > 0
+                            ? t('diagnosticsPage.subtitleAlerts', {count: alerts.length})
+                            : t('diagnosticsPage.subtitleAllOperational');
+
+    const healthHero = (
+        <DashCard tone={healthLevel === "danger" ? "danger" : "glow"} style={{marginBottom: 4}}>
+            <div style={{
+                fontSize: 11, color: colors.textMuted, letterSpacing: "0.08em",
+                textTransform: "uppercase" as const, fontWeight: 600, marginBottom: 8,
+            }}>
+                {t('diagnosticsPage.robotStatus')}
+            </div>
+            <div className="mn-num" style={{fontSize: isMobile ? 40 : 56, lineHeight: 1, color: healthColor}}>
+                {healthVerdict}
+            </div>
+            <div style={{fontSize: 13, color: colors.textSecondary, marginTop: 10}}>
+                {healthSubtitle}
+            </div>
+        </DashCard>
+    );
 
     // ── Health Summary Bar ───────────────────────────────────────────────────
 
     const healthBar = (
         <Card size="small" style={{marginBottom: 12}}>
             <Flex wrap gap="small" align="center">
-                <Typography.Text type="secondary" style={{fontSize: 12, marginRight: 4}}>Health</Typography.Text>
+                <Typography.Text type="secondary" style={{fontSize: 12, marginRight: 4}}>{t('diagnosticsPage.statusLabel')}</Typography.Text>
                 <HealthBadge
-                    label={allContainersOk ? "Containers OK" : "Container Issue"}
+                    label={allContainersOk ? t('diagnosticsPage.containersOk') : t('diagnosticsPage.containerProblem')}
                     color={allContainersOk ? "success" : "error"}
                 />
                 <HealthBadge
-                    label={`GPS: ${gpsFixType}`}
+                    label={t('diagnosticsPage.gpsBadge', {value: gpsFixType})}
                     color={gpsOk ? "success" : gpsWarn ? "warning" : "error"}
                 />
                 <HealthBadge
-                    label={`Battery: ${batteryPercent.toFixed(0)}%`}
-                    color={batteryPercent > 50 ? "success" : batteryPercent > 20 ? "warning" : "error"}
+                    label={t('diagnosticsPage.batteryBadge', {value: batteryPercent.toFixed(0)})}
+                    color={batteryLevel === "ok" ? "success" : batteryLevel === "warn" ? "warning" : "error"}
                 />
                 <HealthBadge
-                    label={emergency.active_emergency ? "EMERGENCY" : "No Emergency"}
-                    color={emergency.active_emergency ? "error" : "success"}
+                    label={emergencyActive ? t('diagnosticsPage.emergencyUpper') : t('diagnosticsPage.noEmergency')}
+                    color={emergencyActive ? "error" : "success"}
                 />
                 <HealthBadge
-                    label={cpuTemp > 0 ? `CPU: ${cpuTemp.toFixed(1)}°C` : "CPU: --"}
+                    label={cpuTemp > 0 ? t('diagnosticsPage.cpuTemp', {value: cpuTemp.toFixed(1)}) : t('diagnosticsPage.cpuTempUnknown')}
                     color={cpuTemp > 70 ? "error" : cpuTemp > 55 ? "warning" : "success"}
                 />
             </Flex>
@@ -210,25 +342,25 @@ export const DiagnosticsPage = () => {
 
     const containerColumns = [
         {
-            title: "Name",
+            title: t('diagnosticsPage.colName'),
             dataIndex: "name",
             key: "name",
             render: (v: string) => <Typography.Text code style={{fontSize: 12}}>{v}</Typography.Text>,
         },
         {
-            title: "State",
+            title: t('diagnosticsPage.colState'),
             dataIndex: "state",
             key: "state",
             render: (v: string) => <Tag color={v === "running" ? "success" : "error"}>{v}</Tag>,
         },
         {
-            title: "Status",
+            title: t('diagnosticsPage.colStatus'),
             dataIndex: "status",
             key: "status",
             render: (v: string) => <Typography.Text style={{fontSize: 12}}>{v}</Typography.Text>,
         },
         {
-            title: "Started",
+            title: t('diagnosticsPage.colStarted'),
             dataIndex: "started_at",
             key: "started_at",
             render: (v: string) => (
@@ -240,11 +372,15 @@ export const DiagnosticsPage = () => {
     ];
 
     const anatomyGps = deriveGpsStatus(gnssStatus);
-    // Yaw from quaternion (Z-axis). pose comes from /odometry/filtered_map.
-    const ori = pose?.pose?.pose?.orientation;
-    const yawDeg = ori
-        ? (Math.atan2(2 * (ori.w * ori.z + ori.x * ori.y), 1 - 2 * (ori.y * ori.y + ori.z * ori.z)) * 180) / Math.PI
-        : 0;
+    // Yaw from quaternion (Z-axis). pose comes from /odometry/filtered_map —
+    // reuse the shared `yaw` derived above.
+    const lidarEnabled = (settings?.lidar_enabled ?? settings?.use_lidar) as boolean | undefined;
+    // LiDAR freshness proxy: fusion_graph's scans_received counter moving
+    // within the last 15 s means the LiDAR is streaming (no /scan
+    // subscription needed just for a health dot).
+    const scansReceivedRaw = fusionStats?.values?.["scans_received"];
+    const scansReceivedSince = useValueSince(scansReceivedRaw);
+    const lidarStreaming = scansReceivedSince !== null && (nowMs - scansReceivedSince) < 15_000;
     const anatomyInputs = {
         batteryPct: batteryPercent,
         vBattery: power.v_battery ?? 0,
@@ -252,14 +388,66 @@ export const DiagnosticsPage = () => {
         escTempC: status.mower_esc_temperature ?? 0,
         gpsLabel: anatomyGps.label,
         gpsOk: anatomyGps.percent >= 50,
-        imuYawDeg: yawDeg,
+        imuYawDeg: yaw,
         imuOk: imu != null && imu.angular_velocity != null,
-        lidarOk: true,
-        wheelLeftRpm: 0,
-        wheelRightRpm: 0,
+        lidarOk: lidarEnabled === false ? false : (lidarStreaming ? true : undefined),
+        // Mowgli is rear-axle drive: only the rear wheels are encoded (the
+        // fronts are unencoded casters whose RPM is always 0).
+        wheelLeftRpm: wheelRpm.rl,
+        wheelRightRpm: wheelRpm.rr,
         bladeOn: (status.mower_motor_rpm ?? 0) > 0,
         rain: status.rain_detected ?? false,
         dockCharging: status.is_charging ?? false,
+    };
+
+    const [firmwareDebugLoading, setFirmwareDebugLoading] = useState(false);
+    const [firmwareDebugTarget, setFirmwareDebugTarget] = useState<boolean | null>(null);
+
+    const firmwareDebugActual = status.firmware_debug_enabled ?? false;
+    const firmwareDebugEnabled = firmwareDebugTarget ?? firmwareDebugActual;
+    const {
+        lines: firmwareDebugLines,
+        loading: firmwareDebugLogLoading,
+        error: firmwareDebugLogError,
+    } = useFirmwareDebugLogs(firmwareDebugEnabled);
+
+    useEffect(() => {
+        if (firmwareDebugTarget !== null && firmwareDebugActual === firmwareDebugTarget) {
+            setFirmwareDebugTarget(null);
+            setFirmwareDebugLoading(false);
+        }
+    }, [firmwareDebugActual, firmwareDebugTarget]);
+
+    useEffect(() => {
+        if (firmwareDebugTarget === null) {
+            return;
+        }
+        const timeoutId = window.setTimeout(() => {
+            setFirmwareDebugTarget(null);
+            setFirmwareDebugLoading(false);
+        }, 4000);
+        return () => window.clearTimeout(timeoutId);
+    }, [firmwareDebugTarget]);
+
+    const toggleFirmwareDebug = async (checked: boolean) => {
+        setFirmwareDebugTarget(checked);
+        setFirmwareDebugLoading(true);
+        try {
+            await guiApi.request({
+                path: "/diagnostics/firmware_debug",
+                method: "POST",
+                type: ContentType.Json,
+                format: "json",
+                body: {enabled: checked},
+            });
+        } catch (e: any) {
+            setFirmwareDebugTarget(null);
+            setFirmwareDebugLoading(false);
+            notification.error({
+                message: t("diagnosticsPage.firmwareDebugToggleFailed"),
+                description: e?.message ?? t("diagnosticsPage.unknownError"),
+            });
+        }
     };
 
     const sectionSystem = (
@@ -269,7 +457,7 @@ export const DiagnosticsPage = () => {
             </Col>
             <Col span={24}>
                 <Card
-                    title={<Space><CloudServerOutlined/> Containers</Space>}
+                    title={<Space><CloudServerOutlined/> {t('diagnosticsPage.containers')}</Space>}
                     size="small"
                     extra={
                         <Button
@@ -277,38 +465,112 @@ export const DiagnosticsPage = () => {
                             icon={<ReloadOutlined spin={loading}/>}
                             onClick={refresh}
                         >
-                            Refresh
+                            {t('diagnosticsPage.refresh')}
                         </Button>
                     }
                 >
+                    {snapshotError && (
+                        <Alert
+                            type="error"
+                            showIcon
+                            style={{marginBottom: 12}}
+                            message={t('diagnosticsPage.snapshotErrorTitle')}
+                            description={snapshotError}
+                        />
+                    )}
                     <Table
                         size="small"
                         dataSource={snapshot?.containers ?? []}
                         columns={containerColumns}
                         rowKey="name"
                         pagination={false}
-                        locale={{emptyText: "No container data"}}
+                        scroll={{x: "max-content"}}
+                        locale={{emptyText: t('diagnosticsPage.noContainerData')}}
                     />
                 </Card>
             </Col>
             <Col xs={24} lg={8}>
-                <Card title={<Space><DashboardOutlined/> CPU</Space>} size="small">
+                <Card title={<Space><DashboardOutlined/> CPU</Space>} size="small" style={{height: "100%"}}>
                     <Statistic
-                        title="Temperature"
+                        title={t('diagnosticsPage.temperature')}
                         value={cpuTemp > 0 ? cpuTemp : undefined}
                         precision={1}
                         suffix="°C"
                         valueStyle={{
                             color: cpuTemp > 70 ? colors.danger : cpuTemp > 55 ? colors.warning : undefined,
                         }}
-                       
                     />
+                </Card>
+            </Col>
+            <Col xs={24} lg={16}>
+                <Card
+                    size="small"
+                    style={{height: "100%"}}
+                    title={<Space><ApiOutlined/> {t("diagnosticsPage.firmwareDebugTitle")}</Space>}
+                    extra={
+                        <Space size={10}>
+                            <Switch
+                                size="small"
+                                checked={firmwareDebugEnabled}
+                                loading={firmwareDebugLoading}
+                                onChange={toggleFirmwareDebug}
+                            />
+                            <SettingOutlined style={{color: colors.textMuted, fontSize: 14}} />
+                        </Space>
+                    }
+                >
+                    {!firmwareDebugEnabled ? (
+                        <div style={{
+                            minHeight: 176,
+                            display: "flex",
+                            flexDirection: "column",
+                            justifyContent: "center",
+                            gap: 8,
+                            color: colors.textMuted,
+                        }}>
+                            <Typography.Text type="secondary">
+                                {t("diagnosticsPage.firmwareDebugOffTitle")}
+                            </Typography.Text>
+                            <Typography.Text type="secondary">
+                                {t("diagnosticsPage.firmwareDebugOffBody")}
+                            </Typography.Text>
+                        </div>
+                    ) : (
+                        <div style={{
+                            minHeight: 176,
+                            maxHeight: 176,
+                            overflowY: "auto",
+                            borderRadius: 8,
+                            border: `1px solid ${colors.borderSubtle}`,
+                            background: colors.bgCard,
+                            padding: "10px 12px",
+                            fontFamily: '"JetBrains Mono", "SF Mono", ui-monospace, monospace',
+                            fontSize: 12,
+                            lineHeight: 1.55,
+                        }}>
+                            {firmwareDebugLines.length === 0 ? (
+                                <Typography.Text type="secondary">
+                                    {firmwareDebugLogLoading
+                                        ? t("diagnosticsPage.firmwareDebugConnecting")
+                                        : firmwareDebugLogError
+                                            ? t("diagnosticsPage.firmwareDebugStreamError")
+                                            : t("diagnosticsPage.firmwareDebugWaiting")}
+                                </Typography.Text>
+                            ) : (
+                                firmwareDebugLines.map((line) => (
+                                    <div key={line.id} style={{color: colors.primary, whiteSpace: "pre-wrap"}}>
+                                        {line.plain}
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    )}
                 </Card>
             </Col>
             {snapshot?.timestamp && (
                 <Col span={24}>
                     <Typography.Text type="secondary" style={{fontSize: 12}}>
-                        Last snapshot: {secondsAgo(snapshot.timestamp)}s ago
+                        {t('diagnosticsPage.lastSnapshot', {seconds: secondsAgo(snapshot.timestamp)})}
                     </Typography.Text>
                 </Col>
             )}
@@ -317,178 +579,40 @@ export const DiagnosticsPage = () => {
 
     // ── Section 2: Localization ──────────────────────────────────────────────
 
-    const zDriftColor = poseZ > 2 ? colors.danger : poseZ > 0.5 ? colors.warning : undefined;
     const flatCheck = Math.abs(roll) < 5 && Math.abs(pitch) < 5;
-    const gpsFixColor = gpsFix.fixType === "RTK_FIX"
-        ? colors.primary
-        : gpsFix.fixType === "RTK_FLOAT"
-            ? colors.warning
-            : colors.danger;
-    const gpsHdop = readGnssNumber(gnssStatus, GnssStatusConstants.CAP_HDOP, gnssStatus.hdop);
-    const gpsVdop = readGnssNumber(gnssStatus, GnssStatusConstants.CAP_VDOP, gnssStatus.vdop);
-    const gpsVerticalAccuracy = readGnssNumber(
-        gnssStatus,
-        GnssStatusConstants.CAP_VERTICAL_ACCURACY,
-        gnssStatus.vertical_accuracy_m,
-    );
-    const gpsHeading = readGnssNumber(gnssStatus, GnssStatusConstants.CAP_HEADING, gnssStatus.heading_deg);
-    const gpsHeadingAccuracy = readGnssNumber(
-        gnssStatus,
-        GnssStatusConstants.CAP_HEADING_ACCURACY,
-        gnssStatus.heading_accuracy_deg,
-    );
-    const gpsSatellitesUsed = readGnssNumber(
-        gnssStatus,
-        GnssStatusConstants.CAP_SATELLITES_USED,
-        gnssStatus.satellites_used,
-    );
-    const gpsSatellitesVisible = readGnssNumber(
-        gnssStatus,
-        GnssStatusConstants.CAP_SATELLITES_VISIBLE,
-        gnssStatus.satellites_visible,
-    );
-    const gpsSatellitesTracked = readGnssNumber(
-        gnssStatus,
-        GnssStatusConstants.CAP_SATELLITES_TRACKED,
-        gnssStatus.satellites_tracked,
-    );
-    const gpsCorrectionAge = readGnssNumber(
-        gnssStatus,
-        GnssStatusConstants.CAP_CORRECTION_AGE,
-        gnssStatus.correction_age_s,
-    );
-    const gpsMeanCn0 = readGnssNumber(
-        gnssStatus,
-        GnssStatusConstants.CAP_MEAN_CN0,
-        gnssStatus.mean_cn0_db_hz,
-    );
-    const gpsMaxCn0 = readGnssNumber(
-        gnssStatus,
-        GnssStatusConstants.CAP_MAX_CN0,
-        gnssStatus.max_cn0_db_hz,
-    );
-    const differentialState = readGnssBooleanState(
-        gnssStatus,
-        GnssStatusConstants.CAP_DIFFERENTIAL_CORRECTIONS,
-        gnssStatus.differential_corrections,
-    );
-    const correctionsState = readGnssBooleanState(
-        gnssStatus,
-        GnssStatusConstants.CAP_CORRECTIONS_ACTIVE,
-        gnssStatus.corrections_active,
-    );
-    const dualAntennaState = readGnssBooleanState(
-        gnssStatus,
-        GnssStatusConstants.CAP_DUAL_ANTENNA_STATUS,
-        gnssStatus.dual_antenna_heading,
-    );
-    const interferenceState = readGnssBooleanState(
-        gnssStatus,
-        GnssStatusConstants.CAP_INTERFERENCE_STATUS,
-        gnssStatus.interference_detected,
-    );
-    const jammingState = readGnssBooleanState(
-        gnssStatus,
-        GnssStatusConstants.CAP_JAMMING_STATUS,
-        gnssStatus.jamming_detected,
-    );
-    const formatOptionalBool = (value: ReturnType<typeof readGnssBooleanState>) => {
-        switch (value) {
-            case "true":
-                return "Yes";
-            case "false":
-                return "No";
-            case "unknown":
-                return "Unknown";
-            case "unsupported":
-            default:
-                return "Not available";
-        }
-    };
-    const typedGpsDetails = [
-        {flag: GnssStatusConstants.CAP_SATELLITES_USED, label: "Satellites used", value: gpsSatellitesUsed},
-        {flag: GnssStatusConstants.CAP_SATELLITES_VISIBLE, label: "Satellites visible", value: gpsSatellitesVisible},
-        {flag: GnssStatusConstants.CAP_SATELLITES_TRACKED, label: "Satellites tracked", value: gpsSatellitesTracked},
-        {flag: GnssStatusConstants.CAP_HDOP, label: "HDOP", value: gpsHdop, precision: 2},
-        {flag: GnssStatusConstants.CAP_VDOP, label: "VDOP", value: gpsVdop, precision: 2},
-        {flag: GnssStatusConstants.CAP_VERTICAL_ACCURACY, label: "Vertical accuracy (m)", value: gpsVerticalAccuracy, precision: 3},
-        {flag: GnssStatusConstants.CAP_HEADING, label: "Heading (deg)", value: gpsHeading, precision: 1},
-        {flag: GnssStatusConstants.CAP_HEADING_ACCURACY, label: "Heading accuracy (deg)", value: gpsHeadingAccuracy, precision: 2},
-        {flag: GnssStatusConstants.CAP_CORRECTION_AGE, label: "Correction age (s)", value: gpsCorrectionAge, precision: 1},
-        {flag: GnssStatusConstants.CAP_MEAN_CN0, label: "Mean CN0 (dB-Hz)", value: gpsMeanCn0, precision: 1},
-        {flag: GnssStatusConstants.CAP_MAX_CN0, label: "Max CN0 (dB-Hz)", value: gpsMaxCn0, precision: 1},
-    ];
-
     const sectionLocalization = (
         <Row gutter={[12, 12]}>
             <Col xs={24} lg={12}>
-                <Card title={<Space><CompassOutlined/> Filtered Pose (map frame)</Space>} size="small"
-                      extra={pose.pose?.pose?.position ? <Tag color="success">Live</Tag> : <Tag>Waiting...</Tag>}>
+                <Card title={<Space><CompassOutlined/> {t('diagnosticsPage.filteredPose')}</Space>} size="small"
+                      extra={pose.pose?.pose?.position ? <Tag color="success">{t('diagnosticsPage.live')}</Tag> : <Tag>{t('diagnosticsPage.waiting')}</Tag>}>
                     <Row gutter={[12, 12]}>
-                        <Col span={8}>
-                            <Statistic
-                                title="X (m)"
-                                value={pose.pose?.pose?.position?.x ?? "-"}
-                                precision={pose.pose?.pose?.position ? 3 : undefined}
-
-                            />
-                        </Col>
-                        <Col span={8}>
-                            <Statistic
-                                title="Y (m)"
-                                value={pose.pose?.pose?.position?.y ?? "-"}
-                                precision={pose.pose?.pose?.position ? 3 : undefined}
-
-                            />
-                        </Col>
-                        <Col span={8}>
-                            <Statistic
-                                title="Z (m)"
-                                value={pose.pose?.pose?.position ? poseZ : "-"}
-                                precision={pose.pose?.pose?.position ? 3 : undefined}
-                                valueStyle={zDriftColor ? {color: zDriftColor} : undefined}
-
-                            />
-                        </Col>
-                        <Col span={8}>
-                            <Statistic
-                                title="Yaw (deg)"
-                                value={yaw}
-                                precision={1}
-                                suffix="°"
-                               
-                            />
-                        </Col>
-                        <Col span={8}>
-                            <Statistic
-                                title="Roll (deg)"
-                                value={roll}
-                                precision={1}
-                                suffix="°"
-                               
-                            />
-                        </Col>
-                        <Col span={8}>
-                            <Statistic
-                                title="Pitch (deg)"
-                                value={pitch}
-                                precision={1}
-                                suffix="°"
-                               
-                            />
-                        </Col>
+                        <TelemetryStat
+                            span={8}
+                            title={t('diagnosticsPage.xM')}
+                            value={pose.pose?.pose?.position?.x ?? null}
+                            precision={3}
+                        />
+                        <TelemetryStat
+                            span={8}
+                            title={t('diagnosticsPage.yM')}
+                            value={pose.pose?.pose?.position?.y ?? null}
+                            precision={3}
+                        />
+                        <TelemetryStat
+                            span={8}
+                            title={t('diagnosticsPage.zM')}
+                            value={pose.pose?.pose?.position ? poseZ : null}
+                            precision={3}
+                            suffix="m"
+                            tone={poseZ > 2 ? "danger" : poseZ > 0.5 ? "warn" : "default"}
+                        />
+                        <TelemetryStat span={8} title={t('diagnosticsPage.yawDeg')} value={yaw} precision={1} suffix="°"/>
+                        <TelemetryStat span={8} title={t('diagnosticsPage.rollDeg')} value={roll} precision={1} suffix="°"/>
+                        <TelemetryStat span={8} title={t('diagnosticsPage.pitchDeg')} value={pitch} precision={1} suffix="°"/>
                         <Col span={12}>
                             <Statistic
-                                title="Z Drift"
-                                value={poseZ.toFixed(3)}
-                                suffix="m"
-                                valueStyle={zDriftColor ? {color: zDriftColor} : undefined}
-                            />
-                        </Col>
-                        <Col span={12}>
-                            <Statistic
-                                title="Flat Check"
-                                value={flatCheck ? "OK" : "DRIFT"}
+                                title={t('diagnosticsPage.flatCheck')}
+                                value={flatCheck ? t('diagnosticsPage.flatCheckOk') : t('diagnosticsPage.flatCheckDrift')}
                                 valueStyle={{color: flatCheck ? undefined : colors.warning}}
                             />
                         </Col>
@@ -496,94 +620,13 @@ export const DiagnosticsPage = () => {
                 </Card>
             </Col>
             <Col xs={24} lg={12}>
-                <Card title={<Space><WifiOutlined/> GPS</Space>} size="small">
-                    <Row gutter={[12, 12]}>
-                        <Col span={24}>
-                            <Space>
-                                <Typography.Text type="secondary" style={{fontSize: 12}}>Fix Type</Typography.Text>
-                                <Tag color={gpsFixColor === colors.primary ? "blue" : gpsFixColor === colors.warning ? "warning" : "error"}>
-                                    {gpsFixType}
-                                </Tag>
-                            </Space>
-                        </Col>
-                        <Col span={12}>
-                            <Statistic
-                                title="X (m)"
-                                value={gps.pose?.pose?.position?.x}
-                                precision={3}
-                               
-                            />
-                        </Col>
-                        <Col span={12}>
-                            <Statistic
-                                title="Y (m)"
-                                value={gps.pose?.pose?.position?.y}
-                                precision={3}
-                               
-                            />
-                        </Col>
-                        <Col span={12}>
-                            <Statistic
-                                title="Altitude (m)"
-                                value={gps.pose?.pose?.position?.z}
-                                precision={3}
-                               
-                            />
-                        </Col>
-                        <Col span={12}>
-                            <Statistic
-                                title="Accuracy (m)"
-                                value={gpsAccuracy}
-                                precision={3}
-                                valueStyle={
-                                    (gpsAccuracy ?? 0) > 0.1
-                                        ? {color: colors.warning}
-                                        : undefined
-                                }
-
-                            />
-                        </Col>
-                        <Col span={24}>
-                            <Descriptions size="small" column={2}>
-                                <Descriptions.Item label="Receiver">{gpsReceiver}</Descriptions.Item>
-                                <Descriptions.Item label="Backend">{gnssStatus.backend || "unknown"}</Descriptions.Item>
-                                <Descriptions.Item label="Differential fix">{formatOptionalBool(differentialState)}</Descriptions.Item>
-                                <Descriptions.Item label="Corrections active">{formatOptionalBool(correctionsState)}</Descriptions.Item>
-                                {hasGnssCapability(gnssStatus, GnssStatusConstants.CAP_DUAL_ANTENNA_STATUS) && (
-                                    <Descriptions.Item label="Dual-antenna heading">
-                                        {formatOptionalBool(dualAntennaState)}
-                                    </Descriptions.Item>
-                                )}
-                                {hasGnssCapability(gnssStatus, GnssStatusConstants.CAP_INTERFERENCE_STATUS) && (
-                                    <Descriptions.Item label="RF interference">
-                                        {formatOptionalBool(interferenceState)}
-                                    </Descriptions.Item>
-                                )}
-                                {hasGnssCapability(gnssStatus, GnssStatusConstants.CAP_JAMMING_STATUS) && (
-                                    <Descriptions.Item label="Jamming">
-                                        {formatOptionalBool(jammingState)}
-                                    </Descriptions.Item>
-                                )}
-                                {typedGpsDetails
-                                    .filter((item) => hasGnssCapability(gnssStatus, item.flag))
-                                    .map((item) => (
-                                        <Descriptions.Item key={item.label} label={item.label}>
-                                            {item.value === undefined
-                                                ? "Unknown"
-                                                : item.precision !== undefined
-                                                    ? item.value.toFixed(item.precision)
-                                                    : String(item.value)}
-                                        </Descriptions.Item>
-                                    ))}
-                            </Descriptions>
-                            {!typedGpsDetails.some((item) => hasGnssCapability(gnssStatus, item.flag)) && (
-                                <Typography.Text type="secondary" style={{fontSize: 11}}>
-                                    Advanced GNSS fields are not available for this backend.
-                                </Typography.Text>
-                            )}
-                        </Col>
-                    </Row>
-                </Card>
+                <GnssLiveDiagnosticsCard
+                    gnssStatus={gnssStatus}
+                    latitude={gps.pose?.pose?.position?.x}
+                    longitude={gps.pose?.pose?.position?.y}
+                    altitudeM={gps.pose?.pose?.position?.z}
+                    horizontalAccuracyM={gpsAccuracy}
+                />
             </Col>
         </Row>
     );
@@ -610,36 +653,197 @@ export const DiagnosticsPage = () => {
     const cogSigmaDeg = (cogYawVar !== undefined && cogYawVar > 0) ? Math.sqrt(cogYawVar) * (180 / Math.PI) : null;
     const magSigmaDeg = (magYawVar !== undefined && magYawVar > 0) ? Math.sqrt(magYawVar) * (180 / Math.PI) : null;
 
-    // Wrap angle difference into (-180, 180].
-    const wrap180 = (d: number) => ((d + 180) % 360 + 360) % 360 - 180;
-    const deltaFilterMag = (!magStale && magYawDeg !== null) ? wrap180(yaw - magYawDeg) : null;
-    const deltaFilterCog = (!cogStale && cogYawDeg !== null) ? wrap180(yaw - cogYawDeg) : null;
+    // Wrap angle difference into (-180, 180] via the shared quaternion util.
+    const deltaFilterMag = (!magStale && magYawDeg !== null) ? wrapDeg180(yaw - magYawDeg) : null;
+    const deltaFilterCog = (!cogStale && cogYawDeg !== null) ? wrapDeg180(yaw - cogYawDeg) : null;
+
+    // ── Rosbag recording panel ───────────────────────────────────────────────
+    // One-click "record all topics" for field debugging: start a capture, drive
+    // the robot to reproduce the issue, stop, then download the .tar.gz to send
+    // back for offline analysis. The recorder runs inside mowgli-ros2.
+
+    const handleRosbagStart = async () => {
+        try {
+            const r = await rosbag.start();
+            notification.success({message: t('diagnosticsPage.rosbagStarted'), description: r?.name});
+        } catch (e: any) {
+            notification.error({message: t('diagnosticsPage.rosbagStartFailed'), description: e.message});
+        }
+    };
+    const handleRosbagStop = async () => {
+        try {
+            const r = await rosbag.stop();
+            notification.success({message: t('diagnosticsPage.rosbagStopped'), description: r?.stopped_name});
+        } catch (e: any) {
+            notification.error({message: t('diagnosticsPage.rosbagStopFailed'), description: e.message});
+        }
+    };
+    const confirmRosbagDelete = (name: string) => {
+        modal.confirm({
+            title: t('diagnosticsPage.rosbagDeleteConfirmTitle'),
+            content: t('diagnosticsPage.rosbagDeleteConfirmBody', {name}),
+            okText: t('diagnosticsPage.rosbagDelete'),
+            cancelText: t('diagnosticsPage.calibrationCancel'),
+            okButtonProps: {danger: true},
+            onOk: async () => {
+                try {
+                    await rosbag.remove(name);
+                    notification.success({message: t('diagnosticsPage.rosbagDeleted'), description: name});
+                } catch (e: any) {
+                    notification.error({message: t('diagnosticsPage.rosbagDeleteFailed'), description: e.message});
+                }
+            },
+        });
+    };
+
+    const rosbagActive = rosbag.status?.active ?? false;
+    const rosbagRecordings = rosbag.status?.recordings ?? [];
+
+    const sectionRosbag = (
+        <Row gutter={[12, 12]}>
+            <Col span={24}>
+                <Card
+                    title={
+                        <Space>
+                            <VideoCameraOutlined/>
+                            {t('diagnosticsPage.rosbagTitle')}
+                            {rosbagActive && (
+                                <Tag color="processing">
+                                    {t('diagnosticsPage.rosbagRecordingTag', {name: rosbag.status?.active_name ?? ""})}
+                                </Tag>
+                            )}
+                        </Space>
+                    }
+                    size="small"
+                    extra={
+                        <Space>
+                            <Button
+                                size="small"
+                                type="primary"
+                                icon={<PlayCircleOutlined/>}
+                                onClick={handleRosbagStart}
+                                loading={rosbag.busy === "start"}
+                                disabled={rosbagActive || rosbag.busy !== null}
+                            >
+                                {t('diagnosticsPage.rosbagStart')}
+                            </Button>
+                            <Button
+                                size="small"
+                                danger
+                                icon={<StopOutlined/>}
+                                onClick={handleRosbagStop}
+                                loading={rosbag.busy === "stop"}
+                                disabled={!rosbagActive || rosbag.busy !== null}
+                            >
+                                {t('diagnosticsPage.rosbagStop')}
+                            </Button>
+                        </Space>
+                    }
+                >
+                    <Space direction="vertical" size="small" style={{width: "100%"}}>
+                        <Alert
+                            type="info"
+                            showIcon
+                            message={t('diagnosticsPage.rosbagHint')}
+                        />
+                        {rosbag.error && (
+                            <Alert type="warning" showIcon message={rosbag.error}/>
+                        )}
+                        <Table<RosbagRecording>
+                            size="small"
+                            rowKey="name"
+                            dataSource={rosbagRecordings}
+                            pagination={false}
+                            locale={{emptyText: t('diagnosticsPage.rosbagEmpty')}}
+                            columns={[
+                                {
+                                    title: t('diagnosticsPage.rosbagColName'),
+                                    dataIndex: "name",
+                                    key: "name",
+                                    render: (name: string, row: RosbagRecording) => (
+                                        <Space>
+                                            <Typography.Text>{name}</Typography.Text>
+                                            {row.active && <Tag color="processing">{t('diagnosticsPage.rosbagLive')}</Tag>}
+                                        </Space>
+                                    ),
+                                },
+                                {
+                                    title: t('diagnosticsPage.rosbagColSize'),
+                                    dataIndex: "size_bytes",
+                                    key: "size_bytes",
+                                    render: (size: number) => formatBytes(size),
+                                },
+                                {
+                                    title: t('diagnosticsPage.rosbagColDate'),
+                                    dataIndex: "modified_at",
+                                    key: "modified_at",
+                                    render: (d: string) => (d ? new Date(d).toLocaleString() : "—"),
+                                },
+                                {
+                                    title: t('diagnosticsPage.rosbagColActions'),
+                                    key: "actions",
+                                    render: (_: unknown, row: RosbagRecording) => (
+                                        <Space>
+                                            <Button
+                                                size="small"
+                                                icon={<DownloadOutlined/>}
+                                                href={rosbag.downloadUrl(row.name)}
+                                                disabled={row.active}
+                                                target="_blank"
+                                            >
+                                                {t('diagnosticsPage.rosbagDownload')}
+                                            </Button>
+                                            <Button
+                                                size="small"
+                                                danger
+                                                icon={<DeleteOutlined/>}
+                                                onClick={() => confirmRosbagDelete(row.name)}
+                                                disabled={row.active}
+                                            />
+                                        </Space>
+                                    ),
+                                },
+                            ]}
+                        />
+                    </Space>
+                </Card>
+            </Col>
+        </Row>
+    );
 
     // ── Fusion Graph (iSAM2) panel ───────────────────────────────────────────
     // fusion_graph_node is the sole map-frame localizer; the panel
     // surfaces the per-tick GraphStats it publishes on
     // /fusion_graph/diagnostics + the Save/Clear service actions.
 
-    const guiApi = useApi();
     const mowerAction = useMowerAction();
     const resetEmergencyAction = mowerAction("emergency", {Emergency: 0});
-    const {stats: fusionStats} = useFusionGraphDiagnostics();
     const [fusionBusy, setFusionBusy] = useState<"save" | "clear" | null>(null);
-
     const callFusionService = async (command: "fusion_graph_save" | "fusion_graph_clear") => {
         setFusionBusy(command === "fusion_graph_save" ? "save" : "clear");
         try {
             const res = await guiApi.mowglinext.callCreate(command, {});
             if (res.error) throw new Error((res.error as any)?.error ?? "service call failed");
             notification.success({
-                message: command === "fusion_graph_save" ? "Graph saved" : "Graph cleared",
+                message: command === "fusion_graph_save" ? t('diagnosticsPage.graphSaved') : t('diagnosticsPage.graphCleared'),
                 description: (res.data as any)?.message,
             });
         } catch (e: any) {
-            notification.error({message: "Fusion graph action failed", description: e.message});
+            notification.error({message: t('diagnosticsPage.fusionGraphActionFailed'), description: e.message});
         } finally {
             setFusionBusy(null);
         }
+    };
+
+    const confirmClearGraph = () => {
+        modal.confirm({
+            title: t('diagnosticsPage.clearGraphConfirmTitle'),
+            content: t('diagnosticsPage.clearGraphConfirmBody'),
+            okText: t('diagnosticsPage.clearGraphConfirmOk'),
+            cancelText: t('diagnosticsPage.calibrationCancel'),
+            okButtonProps: {danger: true},
+            onOk: () => callFusionService("fusion_graph_clear"),
+        });
     };
 
     const fusionAgeS = fusionStats ? Math.floor((nowMs - fusionStats.receivedAt) / 1000) : null;
@@ -669,6 +873,26 @@ export const DiagnosticsPage = () => {
     const scanTotal = (scanOk ?? 0) + (scanFail ?? 0);
     const scanRate = scanTotal > 0 ? Math.round(((scanOk ?? 0) / scanTotal) * 100) : null;
 
+    // ICP / scan-matching detail (live LiDAR monitor).
+    const keyframesTotal = num("keyframes_total");
+    const kfOk = num("kf_matches_ok");
+    const kfFail = num("kf_matches_fail");
+    const kfTotal = (kfOk ?? 0) + (kfFail ?? 0);
+    const kfRate = kfTotal > 0 ? Math.round(((kfOk ?? 0) / kfTotal) * 100) : null;
+    const rejRmse = num("icp_rejects_rmse");
+    const rejInliers = num("icp_rejects_inliers");
+    const rejSanity = num("icp_rejects_sanity");
+    const rejDiverge = num("icp_rejects_divergence");
+    const rejTotal = (rejRmse ?? 0) + (rejInliers ?? 0) + (rejSanity ?? 0) + (rejDiverge ?? 0);
+    const gpsRejWrongfix = num("gps_rejects_wrongfix");
+    const stationaryHandPush = num("stationary_hand_push");
+    // Fraction of received scans that actually became graph factors. The two
+    // counters have slightly different lifecycles (attached counts nodes,
+    // received counts messages), so cap at 100% to avoid nonsense like 108%.
+    const attachRate = (scansReceived !== null && scansReceived > 0 && scansAttached !== null)
+        ? Math.min(100, Math.round((scansAttached / scansReceived) * 100))
+        : null;
+
     const sectionFusionGraph = (
         <Row gutter={[12, 12]}>
             <Col span={24}>
@@ -676,9 +900,9 @@ export const DiagnosticsPage = () => {
                     title={
                         <Space>
                             <CompassOutlined/>
-                            Fusion Graph (iSAM2)
+                            {t('diagnosticsPage.fusionGraphTitle')}
                             <Tag color={fusionStale ? "default" : (fusionStats?.level ?? 0) >= 1 ? "warning" : "success"}>
-                                {fusionStale ? "Stale" : (fusionStats?.message ?? "running")}
+                                {fusionStale ? t('diagnosticsPage.stale') : (fusionStats?.message ?? t('diagnosticsPage.running'))}
                             </Tag>
                         </Space>
                     }
@@ -691,72 +915,95 @@ export const DiagnosticsPage = () => {
                                 loading={fusionBusy === "save"}
                                 disabled={fusionBusy !== null}
                             >
-                                Save graph
+                                {t('diagnosticsPage.saveGraph')}
                             </Button>
                             <Button
                                 size="small"
                                 danger
-                                onClick={() => callFusionService("fusion_graph_clear")}
+                                onClick={confirmClearGraph}
                                 loading={fusionBusy === "clear"}
                                 disabled={fusionBusy !== null}
                             >
-                                Clear graph
+                                {t('diagnosticsPage.clearGraph')}
                             </Button>
                         </Space>
                     }
                 >
                     <Row gutter={[12, 12]}>
-                        <Col xs={12} md={6}>
-                            <Statistic
-                                title="Nodes in graph"
-                                value={totalNodes ?? "—"}
-                                valueStyle={{fontSize: 18}}
-                            />
-                            <Typography.Text type="secondary" style={{fontSize: 11}}>
-                                {scansAttached !== null ? `${scansAttached} with scans` : ""}
-                            </Typography.Text>
-                        </Col>
-                        <Col xs={12} md={6}>
-                            <Statistic
-                                title="Loop closures"
-                                value={loopClosures ?? "—"}
-                                valueStyle={{fontSize: 18, color: (loopClosures ?? 0) > 0 ? colors.success : undefined}}
-                            />
-                        </Col>
-                        <Col xs={12} md={6}>
-                            <Statistic
-                                title="ICP success rate"
-                                value={scanRate !== null ? scanRate : "—"}
-                                suffix={scanRate !== null ? "%" : undefined}
-                                precision={0}
-                                valueStyle={{fontSize: 18}}
-                            />
-                            <Typography.Text type="secondary" style={{fontSize: 11}}>
-                                {scanTotal > 0 ? `${scanOk}/${scanTotal} matches` : `${scansReceived ?? 0} scans received`}
-                            </Typography.Text>
-                        </Col>
-                        <Col xs={12} md={6}>
-                            <Statistic
-                                title="Pose σ"
-                                value={sigmaXY !== null ? sigmaXY : "—"}
-                                suffix={sigmaXY !== null ? "cm" : undefined}
-                                precision={1}
-                                valueStyle={{
-                                    fontSize: 18,
-                                    color: sigmaXY !== null && sigmaXY < 5 ? colors.success : sigmaXY !== null && sigmaXY < 20 ? colors.warning : colors.danger,
-                                }}
-                            />
-                            <Typography.Text type="secondary" style={{fontSize: 11}}>
-                                {sigmaYawDeg !== null ? `yaw ±${sigmaYawDeg.toFixed(2)}°` : ""}
-                            </Typography.Text>
-                        </Col>
+                        <TelemetryStat
+                            xs={12} md={6} large
+                            title={t('diagnosticsPage.nodesInGraph')}
+                            value={totalNodes}
+                            hint={scansAttached !== null ? t('diagnosticsPage.withScans', {count: scansAttached}) : ""}
+                        />
+                        <TelemetryStat
+                            xs={12} md={6} large
+                            title={t('diagnosticsPage.loopClosures')}
+                            value={loopClosures}
+                            tone={(loopClosures ?? 0) > 0 ? "ok" : "default"}
+                        />
+                        <TelemetryStat
+                            xs={12} md={6} large
+                            title={t('diagnosticsPage.icpSuccessRate')}
+                            value={scanRate}
+                            suffix="%"
+                            precision={0}
+                            hint={scanTotal > 0 ? t('diagnosticsPage.matches', {ok: scanOk ?? 0, total: scanTotal}) : t('diagnosticsPage.scansReceived', {count: scansReceived ?? 0})}
+                        />
+                        <TelemetryStat
+                            xs={12} md={6} large
+                            title={t('diagnosticsPage.poseSigma')}
+                            value={sigmaXY}
+                            suffix="cm"
+                            precision={1}
+                            tone={sigmaXY === null ? "danger" : sigmaXY < 5 ? "ok" : sigmaXY < 20 ? "warn" : "danger"}
+                            hint={sigmaYawDeg !== null ? t('diagnosticsPage.yawSigma', {value: sigmaYawDeg.toFixed(2)}) : ""}
+                        />
+                    </Row>
+                    <Row gutter={[12, 12]} style={{marginTop: 4}}>
+                        <TelemetryStat
+                            xs={12} md={6} large
+                            title={t('diagnosticsPage.icpKeyframes')}
+                            value={keyframesTotal}
+                            tone={(keyframesTotal ?? 0) > 0 ? "ok" : "warn"}
+                            hint={kfTotal > 0
+                                ? t('diagnosticsPage.icpKfMatches', {rate: kfRate ?? 0, ok: kfOk ?? 0, total: kfTotal})
+                                : t('diagnosticsPage.icpNoKeyframes')}
+                        />
+                        <TelemetryStat
+                            xs={12} md={6} large
+                            title={t('diagnosticsPage.icpRejects')}
+                            value={rejTotal}
+                            tone={rejTotal > 0 ? "warn" : "ok"}
+                            hint={t('diagnosticsPage.icpRejectBreakdown', {
+                                rmse: rejRmse ?? 0,
+                                inliers: rejInliers ?? 0,
+                                sanity: rejSanity ?? 0,
+                                diverge: rejDiverge ?? 0,
+                            })}
+                        />
+                        <TelemetryStat
+                            xs={12} md={6} large
+                            title={t('diagnosticsPage.attachRateTitle')}
+                            value={attachRate}
+                            suffix="%"
+                            precision={0}
+                            hint={t('diagnosticsPage.scansReceived', {count: scansReceived ?? 0})}
+                        />
+                        <TelemetryStat
+                            xs={12} md={6} large
+                            title={t('diagnosticsPage.handPushTitle')}
+                            value={stationaryHandPush}
+                            tone={(stationaryHandPush ?? 0) > 0 ? "warn" : "default"}
+                            hint={t('diagnosticsPage.icpGpsWrongfix', {count: gpsRejWrongfix ?? 0})}
+                        />
                     </Row>
                     <Typography.Paragraph type="secondary" style={{fontSize: 11, marginTop: 8, marginBottom: 0}}>
-                        GTSAM iSAM2 factor graph. Save persists nodes + scans to{" "}
+                        {t('diagnosticsPage.fusionGraphDescPart1')}{" "}
                         <Typography.Text code>/ros2_ws/maps/fusion_graph.*</Typography.Text>;
-                        Clear wipes the graph and waits for the next GPS fix or set_pose to re-initialize.
-                        Topic: <Typography.Text code>/fusion_graph/diagnostics</Typography.Text>{" "}
-                        {fusionAgeS !== null && <span>· last update {fusionAgeS}s ago</span>}
+                        {t('diagnosticsPage.fusionGraphDescPart2')}
+                        {t('diagnosticsPage.fusionGraphTopicLabel')} <Typography.Text code>/fusion_graph/diagnostics</Typography.Text>{" "}
+                        {fusionAgeS !== null && <span>{t('diagnosticsPage.lastUpdateAgo', {seconds: fusionAgeS})}</span>}
                     </Typography.Paragraph>
                 </Card>
             </Col>
@@ -766,30 +1013,30 @@ export const DiagnosticsPage = () => {
     const sectionHeadingSources = (
         <Row gutter={[12, 12]}>
             <Col span={24}>
-                <Card title={<Space><CompassOutlined/> Heading sources (fused by fusion_graph)</Space>} size="small">
+                <Card title={<Space><CompassOutlined/> {t('diagnosticsPage.headingSources')}</Space>} size="small">
                     <Row gutter={[12, 12]}>
                         <Col xs={24} md={8}>
                             <Space direction="vertical" style={{width: "100%"}}>
                                 <Space>
-                                    <Typography.Text strong>Filter</Typography.Text>
+                                    <Typography.Text strong>{t('diagnosticsPage.filter')}</Typography.Text>
                                     <Tag color="success">/odometry/filtered_map</Tag>
                                 </Space>
-                                <Statistic title="Yaw (deg)" value={yaw} precision={1} suffix="°"/>
+                                <Statistic title={t('diagnosticsPage.yawDeg')} value={yaw} precision={1} suffix="°"/>
                                 <Typography.Text type="secondary" style={{fontSize: 11}}>
-                                    Reference signal for deltas below.
+                                    {t('diagnosticsPage.referenceSignal')}
                                 </Typography.Text>
                             </Space>
                         </Col>
                         <Col xs={24} md={8}>
                             <Space direction="vertical" style={{width: "100%"}}>
                                 <Space>
-                                    <Typography.Text strong>COG (GPS)</Typography.Text>
+                                    <Typography.Text strong>{t('diagnosticsPage.cogGps')}</Typography.Text>
                                     <Tag color={cogStale ? "default" : "processing"}>
-                                        {cogStale ? "Stale" : "Live"}
+                                        {cogStale ? t('diagnosticsPage.stale') : t('diagnosticsPage.live')}
                                     </Tag>
                                 </Space>
                                 <Statistic
-                                    title="Yaw (deg)"
+                                    title={t('diagnosticsPage.yawDeg')}
                                     value={cogYawDeg !== null ? cogYawDeg : "-"}
                                     precision={cogYawDeg !== null ? 1 : undefined}
                                     suffix={cogYawDeg !== null ? "°" : undefined}
@@ -799,7 +1046,7 @@ export const DiagnosticsPage = () => {
                                 </Typography.Text>
                                 {deltaFilterCog !== null && (
                                     <Typography.Text type="secondary" style={{fontSize: 12}}>
-                                        Δ(filter−cog): {deltaFilterCog.toFixed(1)}°
+                                        {t('diagnosticsPage.deltaFilterCog', {value: deltaFilterCog.toFixed(1)})}
                                     </Typography.Text>
                                 )}
                             </Space>
@@ -807,13 +1054,13 @@ export const DiagnosticsPage = () => {
                         <Col xs={24} md={8}>
                             <Space direction="vertical" style={{width: "100%"}}>
                                 <Space>
-                                    <Typography.Text strong>Magnetometer</Typography.Text>
+                                    <Typography.Text strong>{t('diagnosticsPage.magnetometer')}</Typography.Text>
                                     <Tag color={magStale ? "default" : "processing"}>
-                                        {magStale ? "Stale" : "Live"}
+                                        {magStale ? t('diagnosticsPage.stale') : t('diagnosticsPage.live')}
                                     </Tag>
                                 </Space>
                                 <Statistic
-                                    title="Yaw (deg)"
+                                    title={t('diagnosticsPage.yawDeg')}
                                     value={magYawDeg !== null ? magYawDeg : "-"}
                                     precision={magYawDeg !== null ? 1 : undefined}
                                     suffix={magYawDeg !== null ? "°" : undefined}
@@ -823,7 +1070,7 @@ export const DiagnosticsPage = () => {
                                 </Typography.Text>
                                 {deltaFilterMag !== null && (
                                     <Typography.Text type="secondary" style={{fontSize: 12}}>
-                                        Δ(filter−mag): {deltaFilterMag.toFixed(1)}°
+                                        {t('diagnosticsPage.deltaFilterMag', {value: deltaFilterMag.toFixed(1)})}
                                     </Typography.Text>
                                 )}
                             </Space>
@@ -843,37 +1090,34 @@ export const DiagnosticsPage = () => {
         highLevelStatus.state === 4 ? "cyan" :
         "default";
 
-    const coverageColumns = [
-        {title: "Area", dataIndex: "area_index", key: "area_index"},
-        {
-            title: "Coverage",
-            dataIndex: "coverage_percent",
-            key: "coverage_percent",
-            render: (v: number) => <Progress percent={Math.round(v * 100) / 100} size="small" style={{minWidth: 80}}/>,
-        },
-        {title: "Total Cells", dataIndex: "total_cells", key: "total_cells"},
-        {title: "Mowed", dataIndex: "mowed_cells", key: "mowed_cells"},
-        {title: "Obstacles", dataIndex: "obstacle_cells", key: "obstacle_cells"},
-        {title: "Strips Left", dataIndex: "strips_remaining", key: "strips_remaining"},
-    ];
+    // Live mowing progress straight from HighLevelStatus (the REST snapshot's
+    // per-area coverage grid was removed backend-side and always came back
+    // empty — see /diagnostics/snapshot).
+    const mowingActive = highLevelStatus.state === HIGH_LEVEL_STATE_AUTONOMOUS;
+    const totalSwaths = highLevelStatus.total_swaths ?? 0;
 
     const sectionBtCoverage = (
         <Row gutter={[12, 12]}>
             <Col xs={24}>
-                <BTStateGraph current={highLevelStatus.state_name}/>
+                <BTStateGraph current={highLevelStatus.state_name} detail={stateSinceLabel}/>
             </Col>
             <Col xs={24} lg={12}>
-                <Card title={<Space><ApiOutlined/> BT State</Space>} size="small">
+                <Card title={<Space><ApiOutlined/> {t('diagnosticsPage.btState')}</Space>} size="small">
                     <Space direction="vertical" style={{width: "100%"}}>
                         <Space>
-                            <Typography.Text type="secondary" style={{fontSize: 12}}>State</Typography.Text>
+                            <Typography.Text type="secondary" style={{fontSize: 12}}>{t('diagnosticsPage.state')}</Typography.Text>
                             <Tag color={btStateColor} style={{fontSize: 14, padding: "2px 12px"}}>
                                 {highLevelStatus.state_name ?? "--"}
                             </Tag>
+                            {stateSinceLabel && (
+                                <Typography.Text type="secondary" style={{fontSize: 12}}>
+                                    {t('diagnosticsPage.stateSince', {duration: stateSinceLabel})}
+                                </Typography.Text>
+                            )}
                         </Space>
                         {highLevelStatus.sub_state_name && (
                             <Space>
-                                <Typography.Text type="secondary" style={{fontSize: 12}}>Sub-state</Typography.Text>
+                                <Typography.Text type="secondary" style={{fontSize: 12}}>{t('diagnosticsPage.subState')}</Typography.Text>
                                 <Tag>{highLevelStatus.sub_state_name}</Tag>
                             </Space>
                         )}
@@ -881,7 +1125,7 @@ export const DiagnosticsPage = () => {
                     <Row gutter={[12, 12]} style={{marginTop: 12}}>
                         <Col span={8}>
                             <Statistic
-                                title="Battery"
+                                title={t('diagnosticsPage.battery')}
                                 value={batteryPercent}
                                 precision={0}
                                 suffix="%"
@@ -892,17 +1136,17 @@ export const DiagnosticsPage = () => {
                         </Col>
                         <Col span={8}>
                             <Statistic
-                                title="Voltage"
+                                title={t('diagnosticsPage.voltage')}
                                 value={power.v_battery}
                                 precision={2}
                                 suffix="V"
-                               
+
                             />
                         </Col>
                         <Col span={8}>
                             <Statistic
-                                title="Charging"
-                                value={highLevelStatus.is_charging ? "Yes" : "No"}
+                                title={t('diagnosticsPage.charging')}
+                                value={highLevelStatus.is_charging ? t('diagnosticsPage.yes') : t('diagnosticsPage.no')}
                                 valueStyle={{
                                     color: highLevelStatus.is_charging ? colors.primary : undefined,
                                 }}
@@ -910,8 +1154,8 @@ export const DiagnosticsPage = () => {
                         </Col>
                         <Col span={8}>
                             <Statistic
-                                title="Charge current"
-                                value={power.charge_current}
+                                title={t('diagnosticsPage.chargeCurrent')}
+                                value={clampTinyToZero(power.charge_current) ?? undefined}
                                 precision={2}
                                 suffix="A"
                                 valueStyle={{
@@ -923,8 +1167,8 @@ export const DiagnosticsPage = () => {
                         </Col>
                         <Col span={8}>
                             <Statistic
-                                title="Charger voltage"
-                                value={power.v_charge}
+                                title={t('diagnosticsPage.chargerVoltage')}
+                                value={clampTinyToZero(power.v_charge) ?? undefined}
                                 precision={2}
                                 suffix="V"
                             />
@@ -932,38 +1176,48 @@ export const DiagnosticsPage = () => {
                     </Row>
                     <div style={{marginTop: 12}}>
                         <Space wrap>
-                            <Typography.Text type="secondary" style={{fontSize: 12}}>Emergency</Typography.Text>
+                            <Typography.Text type="secondary" style={{fontSize: 12}}>{t('diagnosticsPage.emergency')}</Typography.Text>
                             <Tag color={emergency.active_emergency ? "error" : emergency.latched_emergency ? "warning" : "default"}>
                                 {emergency.active_emergency
-                                    ? (emergency.reason ?? "ACTIVE")
+                                    ? (emergency.reason ?? t('diagnosticsPage.emergencyActive'))
                                     : emergency.latched_emergency
-                                        ? "Latched"
-                                        : "Clear"}
+                                        ? t('diagnosticsPage.latched')
+                                        : t('diagnosticsPage.clear')}
                             </Tag>
                             {(emergency.active_emergency || emergency.latched_emergency) && (
-                                <Button
+                                <AsyncButton
                                     danger
                                     size="small"
                                     icon={<AlertOutlined/>}
-                                    onClick={resetEmergencyAction}
+                                    onAsyncClick={async () => {
+                                        await resetEmergencyAction();
+                                        notification.success({message: t('diagnosticsPage.resetEmergencySuccess')});
+                                    }}
                                 >
-                                    Reset emergency
-                                </Button>
+                                    {t('diagnosticsPage.resetEmergency')}
+                                </AsyncButton>
                             )}
                         </Space>
                     </div>
-                    {btNodeStates.size > 0 && (
+                    {(btNodeStates.size > 0 || nav2Recovery.active) && (
                         <div style={{marginTop: 12}}>
-                            <Typography.Text type="secondary" style={{fontSize: 12, display: "block", marginBottom: 4}}>Active BT Nodes</Typography.Text>
+                            <Typography.Text type="secondary" style={{fontSize: 12, display: "block", marginBottom: 4}}>{t('diagnosticsPage.nav2Activity')}</Typography.Text>
+                            {nav2Recovery.active && (
+                                <Alert
+                                    type="warning"
+                                    showIcon
+                                    style={{marginBottom: 6, fontSize: 12}}
+                                    message={t('diagnosticsPage.nav2RecoveryActive', {
+                                        node: nav2Recovery.nodeName ?? t('diagnosticsPage.nav2RecoveryGeneric'),
+                                        duration: formatDuration(recoveryDurationMs),
+                                    })}
+                                />
+                            )}
                             <Flex wrap gap={4}>
                                 {Array.from(btNodeStates.entries())
-                                    .filter(([, status]) => status === "RUNNING" || status === "SUCCESS")
-                                    .map(([name, status]) => (
-                                        <Tag
-                                            key={name}
-                                            color={status === "RUNNING" ? "processing" : status === "SUCCESS" ? "success" : "default"}
-                                            style={{fontSize: 11}}
-                                        >
+                                    .filter(([, state]) => state.status === "RUNNING" && !isBTNodeStale(state, nowMs))
+                                    .map(([name]) => (
+                                        <Tag key={name} color="processing" style={{fontSize: 11}}>
                                             {name}
                                         </Tag>
                                     ))}
@@ -973,15 +1227,43 @@ export const DiagnosticsPage = () => {
                 </Card>
             </Col>
             <Col xs={24} lg={12}>
-                <Card title="Coverage" size="small">
-                    <Table
-                        size="small"
-                        dataSource={snapshot?.coverage ?? []}
-                        columns={coverageColumns}
-                        rowKey="area_index"
-                        pagination={false}
-                        locale={{emptyText: "No coverage data"}}
-                    />
+                <Card title={t('diagnosticsPage.mowProgressTitle')} size="small">
+                    {mowingActive || totalSwaths > 0 ? (
+                        <>
+                            <Progress
+                                percent={Math.round(highLevelStatus.coverage_percent ?? 0)}
+                                status={mowingActive ? "active" : "normal"}
+                            />
+                            <Row gutter={[12, 12]} style={{marginTop: 12}}>
+                                <TelemetryStat
+                                    span={8}
+                                    title={t('diagnosticsPage.currentAreaLabel')}
+                                    value={(highLevelStatus.current_area ?? -1) >= 0 ? highLevelStatus.current_area : null}
+                                />
+                                <TelemetryStat
+                                    span={8}
+                                    title={t('diagnosticsPage.subPathsLabel')}
+                                    value={totalSwaths > 0
+                                        ? `${highLevelStatus.completed_swaths ?? 0} / ${totalSwaths}`
+                                        : null}
+                                    hint={(highLevelStatus.skipped_swaths ?? 0) > 0
+                                        ? t('diagnosticsPage.subPathsSkipped', {count: highLevelStatus.skipped_swaths})
+                                        : ""}
+                                />
+                                <TelemetryStat
+                                    span={8}
+                                    title={t('diagnosticsPage.colCoverage')}
+                                    value={highLevelStatus.coverage_percent}
+                                    precision={1}
+                                    suffix="%"
+                                />
+                            </Row>
+                        </>
+                    ) : (
+                        <Typography.Text type="secondary" style={{fontSize: 12}}>
+                            {t('diagnosticsPage.noActiveMowing')}
+                        </Typography.Text>
+                    )}
                 </Card>
             </Col>
         </Row>
@@ -999,14 +1281,16 @@ export const DiagnosticsPage = () => {
         <Row gutter={[12, 12]}>
             <Col xs={24}>
                 <Card
-                    title="Configuration Cross-checks"
+                    title={t('diagnosticsPage.configurationCrossChecks')}
                     size="small"
                     extra={
                         <Tag color={
                             crossCheckStatus === "ok" ? "success" :
                             crossCheckStatus === "warn" ? "warning" : "error"
                         }>
-                            {crossCheckStatus.toUpperCase()}
+                            {crossCheckStatus === "ok" ? t('diagnosticsPage.crossCheckOk') :
+                                crossCheckStatus === "warn" ? t('diagnosticsPage.crossCheckWarn') :
+                                    t('diagnosticsPage.crossCheckError')}
                         </Tag>
                     }
                 >
@@ -1018,54 +1302,54 @@ export const DiagnosticsPage = () => {
                         </Space>
                     ) : (
                         <Typography.Text type="secondary" style={{fontSize: 12, display: "block", marginBottom: 12}}>
-                            No warnings.
+                            {t('diagnosticsPage.noWarnings')}
                         </Typography.Text>
                     )}
                     {crossChecks?.dock_pose && (
                         <Row gutter={[8, 4]}>
                             <Col span={24}>
-                                <Typography.Text type="secondary" style={{fontSize: 11}}>Dock pose</Typography.Text>
+                                <Typography.Text type="secondary" style={{fontSize: 11}}>{t('diagnosticsPage.dockPose')}</Typography.Text>
                             </Col>
                             <Col span={8}>
                                 <Statistic
-                                    title="X (m)"
+                                    title={t('diagnosticsPage.xM')}
                                     value={crossChecks.dock_pose.configured_x}
                                     precision={3}
                                 />
                             </Col>
                             <Col span={8}>
                                 <Statistic
-                                    title="Y (m)"
+                                    title={t('diagnosticsPage.yM')}
                                     value={crossChecks.dock_pose.configured_y}
                                     precision={3}
                                 />
                             </Col>
                             <Col span={8}>
                                 <Statistic
-                                    title="Yaw (deg)"
+                                    title={t('diagnosticsPage.yawDeg')}
                                     value={(crossChecks.dock_pose.configured_yaw * 180 / Math.PI).toFixed(1)}
                                     suffix="°"
                                 />
                             </Col>
                             <Col span={12}>
                                 <Statistic
-                                    title="Datum lat"
+                                    title={t('diagnosticsPage.datumLat')}
                                     value={crossChecks.dock_pose.datum_lat}
-                                    precision={7}
+                                    precision={9}
                                 />
                             </Col>
                             <Col span={12}>
                                 <Statistic
-                                    title="Datum lon"
+                                    title={t('diagnosticsPage.datumLon')}
                                     value={crossChecks.dock_pose.datum_lon}
-                                    precision={7}
+                                    precision={9}
                                 />
                             </Col>
                             <Col span={24}>
                                 <Space>
-                                    <Typography.Text type="secondary" style={{fontSize: 12}}>Config present</Typography.Text>
+                                    <Typography.Text type="secondary" style={{fontSize: 12}}>{t('diagnosticsPage.configPresent')}</Typography.Text>
                                     <Tag color={crossChecks.dock_pose.has_config ? "success" : "warning"}>
-                                        {crossChecks.dock_pose.has_config ? "Yes" : "No"}
+                                        {crossChecks.dock_pose.has_config ? t('diagnosticsPage.yes') : t('diagnosticsPage.no')}
                                     </Tag>
                                 </Space>
                             </Col>
@@ -1083,58 +1367,79 @@ export const DiagnosticsPage = () => {
     // Mag is gated on do_mag_calibration at the ROS node, so we just log a
     // hint — enabling the parameter requires an install-side config change.
 
-    const runImuCalibration = async () => {
-        try {
-            notification.info({
-                message: "Calibration started",
-                description: "Running 3 forward/back cycles plus optional dock pre-phase. This may take up to 2 minutes.",
-            });
-            const res = await fetch("/api/calibration/imu-yaw", {
-                method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({duration_sec: 30}),
-            });
-            if (!res.ok) {
-                throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-            }
-            notification.success({message: "Calibration complete", description: "Refreshing status..."});
-            refreshCalibration();
-        } catch (e) {
-            notification.error({
-                message: "Calibration failed",
-                description: e instanceof Error ? e.message : String(e),
-            });
-        }
+    // IMU/dock calibration physically drives the robot. Use the shared
+    // useImuYawCalibration hook — it owns the AbortController + ~155 s client
+    // timeout + error notification. The dock pose + imu_yaw are persisted
+    // server-side to mowgli_robot.yaml, so on this page we only refresh the
+    // read-only calibration status afterwards (no form to write into).
+    const {
+        calibRunning: imuCalibRunning,
+        startCalibration: startImuCalibration,
+    } = useImuYawCalibration({onApplyValue: () => { /* persisted server-side */ }});
+
+    const [magCalibRunning, setMagCalibRunning] = useState(false);
+    // A single busy flag shared by every calibration button: while any
+    // calibration POST is in flight, all run-buttons disable so a second
+    // click cannot fire a concurrent drive command.
+    const calibrationBusy = imuCalibRunning || magCalibRunning;
+
+    const runImuCalibration = () => {
+        if (calibrationBusy) return;
+        modal.confirm({
+            title: t('diagnosticsPage.imuCalibrationConfirmTitle'),
+            content: t('diagnosticsPage.imuCalibrationConfirmBody'),
+            okText: t('diagnosticsPage.imuCalibrationConfirmOk'),
+            cancelText: t('diagnosticsPage.calibrationCancel'),
+            okButtonProps: {danger: true},
+            onOk: async () => {
+                await startImuCalibration();
+                refreshCalibration();
+            },
+        });
     };
 
-    const runMagCalibration = async () => {
-        try {
-            notification.info({
-                message: "Magnetometer calibration started",
-                description: "Robot will run a figure-8 (~30 s). Make sure there's at least 1.5 m clear in front and behind.",
-                duration: 6,
-            });
-            const res = await fetch("/api/calibration/magnetometer", {
-                method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({}),
-            });
-            if (!res.ok) {
-                throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-            }
-            const data = await res.json();
-            if (data.success) {
-                notification.success({message: "Magnetometer calibration complete", description: data.message || "Refreshing status..."});
-            } else {
-                notification.error({message: "Magnetometer calibration failed", description: data.message || "Unknown error"});
-            }
-            refreshCalibration();
-        } catch (e) {
-            notification.error({
-                message: "Magnetometer calibration failed",
-                description: e instanceof Error ? e.message : String(e),
-            });
-        }
+    const runMagCalibration = () => {
+        if (calibrationBusy) return;
+        modal.confirm({
+            title: t('diagnosticsPage.magCalibrationConfirmTitle'),
+            content: t('diagnosticsPage.magCalibrationConfirmBody'),
+            okText: t('diagnosticsPage.magCalibrationConfirmOk'),
+            cancelText: t('diagnosticsPage.calibrationCancel'),
+            okButtonProps: {danger: true},
+            onOk: async () => {
+                setMagCalibRunning(true);
+                const controller = new AbortController();
+                const timeoutId = window.setTimeout(() => controller.abort(), MAG_CALIB_CLIENT_TIMEOUT_MS);
+                try {
+                    const res = await fetch("/api/calibration/magnetometer", {
+                        method: "POST",
+                        headers: {"Content-Type": "application/json"},
+                        body: JSON.stringify({}),
+                        signal: controller.signal,
+                    });
+                    if (!res.ok) {
+                        throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+                    }
+                    const data = await res.json();
+                    if (data.success) {
+                        notification.success({message: t('diagnosticsPage.magCalibrationComplete'), description: data.message || t('diagnosticsPage.refreshingStatus')});
+                    } else {
+                        notification.error({message: t('diagnosticsPage.magCalibrationFailed'), description: data.message || t('diagnosticsPage.unknownError')});
+                    }
+                    refreshCalibration();
+                } catch (e: any) {
+                    notification.error({
+                        message: t('diagnosticsPage.magCalibrationFailed'),
+                        description: e?.name === "AbortError"
+                            ? t('diagnosticsPage.calibrationTimedOut')
+                            : (e instanceof Error ? e.message : String(e)),
+                    });
+                } finally {
+                    window.clearTimeout(timeoutId);
+                    setMagCalibRunning(false);
+                }
+            },
+        });
     };
 
     const formatTs = (ts?: string): string => {
@@ -1152,13 +1457,23 @@ export const DiagnosticsPage = () => {
 
     const sectionCalibrationStatus = (
         <Row gutter={[12, 12]}>
+            {calibrationError && (
+                <Col xs={24}>
+                    <Alert
+                        type="error"
+                        showIcon
+                        message={t('diagnosticsPage.calibrationStatusErrorTitle')}
+                        description={calibrationError}
+                    />
+                </Col>
+            )}
             <Col xs={24} lg={8}>
                 <Card
-                    title={<Space><CompassOutlined/> Dock calibration</Space>}
+                    title={<Space><CompassOutlined/> {t('diagnosticsPage.dockCalibration')}</Space>}
                     size="small"
                     extra={
                         <Tag color={dockCal?.present ? "success" : "warning"}>
-                            {dockCal?.present ? "Present" : "Missing"}
+                            {dockCal?.present ? t('diagnosticsPage.present') : t('diagnosticsPage.missing')}
                         </Tag>
                     }
                     actions={[
@@ -1166,18 +1481,20 @@ export const DiagnosticsPage = () => {
                             key="run"
                             size="small"
                             type="link"
+                            loading={imuCalibRunning}
+                            disabled={calibrationBusy}
                             onClick={runImuCalibration}
                         >
-                            Run calibration
+                            {t('diagnosticsPage.runCalibration')}
                         </Button>,
                     ]}
                 >
                     {dockCal?.present && !dockCal?.error ? (
                         <Descriptions size="small" column={1}>
-                            <Descriptions.Item label="Position">
+                            <Descriptions.Item label={t('diagnosticsPage.position')}>
                                 ({dockCal.dock_pose_x?.toFixed(3)}, {dockCal.dock_pose_y?.toFixed(3)}) m
                             </Descriptions.Item>
-                            <Descriptions.Item label="Yaw">
+                            <Descriptions.Item label={t('diagnosticsPage.yaw')}>
                                 {dockCal.dock_pose_yaw_deg?.toFixed(2)}°
                             </Descriptions.Item>
                         </Descriptions>
@@ -1185,18 +1502,18 @@ export const DiagnosticsPage = () => {
                         <Alert type="error" showIcon message={dockCal.error}/>
                     ) : (
                         <Typography.Text type="secondary" style={{fontSize: 12}}>
-                            Dock pose not yet set in mowgli_robot.yaml. Run the calibration while the robot is docked, or place the dock manually from the map view.
+                            {t('diagnosticsPage.dockPoseNotSet')}
                         </Typography.Text>
                     )}
                 </Card>
             </Col>
             <Col xs={24} lg={8}>
                 <Card
-                    title={<Space><CompassOutlined/> IMU bias calibration</Space>}
+                    title={<Space><CompassOutlined/> {t('diagnosticsPage.imuBiasCalibration')}</Space>}
                     size="small"
                     extra={
                         <Tag color={imuCal?.present ? "success" : "warning"}>
-                            {imuCal?.present ? "Present" : "Missing"}
+                            {imuCal?.present ? t('diagnosticsPage.present') : t('diagnosticsPage.missing')}
                         </Tag>
                     }
                     actions={[
@@ -1204,26 +1521,28 @@ export const DiagnosticsPage = () => {
                             key="run"
                             size="small"
                             type="link"
+                            loading={imuCalibRunning}
+                            disabled={calibrationBusy}
                             onClick={runImuCalibration}
                         >
-                            Run calibration
+                            {t('diagnosticsPage.runCalibration')}
                         </Button>,
                     ]}
                 >
                     {imuCal?.present && !imuCal?.error ? (
                         <Descriptions size="small" column={1}>
-                            <Descriptions.Item label="Calibrated at">
+                            <Descriptions.Item label={t('diagnosticsPage.calibratedAt')}>
                                 {formatTs(imuCal.calibrated_at)}
                             </Descriptions.Item>
-                            <Descriptions.Item label="Samples">
+                            <Descriptions.Item label={t('diagnosticsPage.samples')}>
                                 {imuCal.samples_used ?? "—"}
                             </Descriptions.Item>
-                            <Descriptions.Item label="Gyro bias (rad/s)">
+                            <Descriptions.Item label={t('diagnosticsPage.gyroBias')}>
                                 [{imuCal.gyro_bias_x?.toFixed(5) ?? "—"},{" "}
                                 {imuCal.gyro_bias_y?.toFixed(5) ?? "—"},{" "}
                                 {imuCal.gyro_bias_z?.toFixed(5) ?? "—"}]
                             </Descriptions.Item>
-                            <Descriptions.Item label="Implied pitch/roll">
+                            <Descriptions.Item label={t('diagnosticsPage.impliedPitchRoll')}>
                                 {imuCal.implied_pitch_deg?.toFixed(2)}° / {imuCal.implied_roll_deg?.toFixed(2)}°
                             </Descriptions.Item>
                         </Descriptions>
@@ -1231,18 +1550,18 @@ export const DiagnosticsPage = () => {
                         <Alert type="error" showIcon message={imuCal.error}/>
                     ) : (
                         <Typography.Text type="secondary" style={{fontSize: 12}}>
-                            No imu_calibration.txt yet — hardware_bridge will auto-calibrate on the next dock.
+                            {t('diagnosticsPage.noImuCalibration')}
                         </Typography.Text>
                     )}
                 </Card>
             </Col>
             <Col xs={24} lg={8}>
                 <Card
-                    title={<Space><CompassOutlined/> Magnetometer calibration</Space>}
+                    title={<Space><CompassOutlined/> {t('diagnosticsPage.magnetometerCalibration')}</Space>}
                     size="small"
                     extra={
                         <Tag color={magCal?.present ? "success" : "default"}>
-                            {magCal?.present ? "Present" : "Disabled"}
+                            {magCal?.present ? t('diagnosticsPage.present') : t('diagnosticsPage.disabled')}
                         </Tag>
                     }
                     actions={[
@@ -1250,15 +1569,17 @@ export const DiagnosticsPage = () => {
                             key="run"
                             size="small"
                             type="link"
+                            loading={magCalibRunning}
+                            disabled={calibrationBusy}
                             onClick={runMagCalibration}
                         >
-                            Enable & run
+                            {t('diagnosticsPage.enableAndRun')}
                         </Button>,
                     ]}
                 >
                     {magCal?.present && !magCal?.error ? (
                         <Descriptions size="small" column={1}>
-                            <Descriptions.Item label="Calibrated at">
+                            <Descriptions.Item label={t('diagnosticsPage.calibratedAt')}>
                                 {formatTs(magCal.calibrated_at)}
                             </Descriptions.Item>
                             <Descriptions.Item label="|B| mean">
@@ -1267,7 +1588,7 @@ export const DiagnosticsPage = () => {
                             <Descriptions.Item label="|B| std">
                                 {magCal.magnitude_std_uT?.toFixed(2)} µT
                             </Descriptions.Item>
-                            <Descriptions.Item label="Samples">
+                            <Descriptions.Item label={t('diagnosticsPage.samples')}>
                                 {magCal.sample_count ?? "—"}
                             </Descriptions.Item>
                         </Descriptions>
@@ -1275,7 +1596,7 @@ export const DiagnosticsPage = () => {
                         <Alert type="error" showIcon message={magCal.error}/>
                     ) : (
                         <Typography.Text type="secondary" style={{fontSize: 12}}>
-                            Magnetometer fusion is off. Enable <Typography.Text code>do_mag_calibration</Typography.Text> on calibrate_imu_yaw_node to include the rotation phase.
+                            {t('diagnosticsPage.magFusionOffPart1')}<Typography.Text code>do_mag_calibration</Typography.Text>{t('diagnosticsPage.magFusionOffPart2')}
                         </Typography.Text>
                     )}
                 </Card>
@@ -1291,53 +1612,53 @@ export const DiagnosticsPage = () => {
                 <Card title="IMU" size="small">
                     <Row gutter={[12, 8]}>
                         <Col span={8}>
-                            <Statistic title="Ang Vel X" value={imu.angular_velocity?.x} precision={4}/>
+                            <Statistic title={t('diagnosticsPage.angVelX')} value={imu.angular_velocity?.x} precision={4}/>
                         </Col>
                         <Col span={8}>
-                            <Statistic title="Ang Vel Y" value={imu.angular_velocity?.y} precision={4}/>
+                            <Statistic title={t('diagnosticsPage.angVelY')} value={imu.angular_velocity?.y} precision={4}/>
                         </Col>
                         <Col span={8}>
-                            <Statistic title="Ang Vel Z" value={imu.angular_velocity?.z} precision={4}/>
+                            <Statistic title={t('diagnosticsPage.angVelZ')} value={imu.angular_velocity?.z} precision={4}/>
                         </Col>
                         <Col span={8}>
-                            <Statistic title="Lin Acc X" value={imu.linear_acceleration?.x} precision={4}/>
+                            <Statistic title={t('diagnosticsPage.linAccX')} value={imu.linear_acceleration?.x} precision={4}/>
                         </Col>
                         <Col span={8}>
-                            <Statistic title="Lin Acc Y" value={imu.linear_acceleration?.y} precision={4}/>
+                            <Statistic title={t('diagnosticsPage.linAccY')} value={imu.linear_acceleration?.y} precision={4}/>
                         </Col>
                         <Col span={8}>
-                            <Statistic title="Lin Acc Z" value={imu.linear_acceleration?.z} precision={4}/>
+                            <Statistic title={t('diagnosticsPage.linAccZ')} value={imu.linear_acceleration?.z} precision={4}/>
                         </Col>
                     </Row>
                 </Card>
             </Col>
             <Col xs={24} lg={12}>
-                <Card title="Wheel Odometry" size="small">
+                <Card title={t('diagnosticsPage.wheelOdometry')} size="small">
                     <Row gutter={[12, 8]}>
                         <Col span={12}>
                             <Statistic
-                                title="Linear Vel (m/s)"
+                                title={t('diagnosticsPage.linearVel')}
                                 value={wheelOdom.twist?.twist?.linear?.x}
                                 precision={3}
                             />
                         </Col>
                         <Col span={12}>
                             <Statistic
-                                title="Angular Vel (rad/s)"
+                                title={t('diagnosticsPage.angularVel')}
                                 value={wheelOdom.twist?.twist?.angular?.z}
                                 precision={3}
                             />
                         </Col>
                         <Col span={12}>
                             <Statistic
-                                title="Pose X (m)"
+                                title={t('diagnosticsPage.poseXM')}
                                 value={wheelOdom.pose?.pose?.position?.x}
                                 precision={3}
                             />
                         </Col>
                         <Col span={12}>
                             <Statistic
-                                title="Pose Y (m)"
+                                title={t('diagnosticsPage.poseYM')}
                                 value={wheelOdom.pose?.pose?.position?.y}
                                 precision={3}
                             />
@@ -1346,14 +1667,21 @@ export const DiagnosticsPage = () => {
                 </Card>
             </Col>
             <Col span={24}>
-                <Card title="Per-Wheel Encoders" size="small">
+                <Card title={t('diagnosticsPage.perWheelEncoders')} size="small">
                     <Row gutter={[12, 12]}>
                         {[
-                            {label: 'Front Left',  rpm: wheelRpm.fl, ticks: wheelTicks.wheel_ticks_fl, dir: wheelTicks.wheel_direction_fl, validMask: 1},
-                            {label: 'Front Right', rpm: wheelRpm.fr, ticks: wheelTicks.wheel_ticks_fr, dir: wheelTicks.wheel_direction_fr, validMask: 2},
-                            {label: 'Rear Left',   rpm: wheelRpm.rl, ticks: wheelTicks.wheel_ticks_rl, dir: wheelTicks.wheel_direction_rl, validMask: 4},
-                            {label: 'Rear Right',  rpm: wheelRpm.rr, ticks: wheelTicks.wheel_ticks_rr, dir: wheelTicks.wheel_direction_rr, validMask: 8},
-                        ].map(w => {
+                            {label: t('diagnosticsPage.frontLeft'),  rpm: wheelRpm.fl, ticks: wheelTicks.wheel_ticks_fl, dir: wheelTicks.wheel_direction_fl, validMask: 1},
+                            {label: t('diagnosticsPage.frontRight'), rpm: wheelRpm.fr, ticks: wheelTicks.wheel_ticks_fr, dir: wheelTicks.wheel_direction_fr, validMask: 2},
+                            {label: t('diagnosticsPage.rearLeft'),   rpm: wheelRpm.rl, ticks: wheelTicks.wheel_ticks_rl, dir: wheelTicks.wheel_direction_rl, validMask: 4},
+                            {label: t('diagnosticsPage.rearRight'),  rpm: wheelRpm.rr, ticks: wheelTicks.wheel_ticks_rr, dir: wheelTicks.wheel_direction_rr, validMask: 8},
+                        // Only show wheels the firmware reports encoders for
+                        // (rear-only on Mowgli) — permanent "no encoder
+                        // reading" slots are noise. Until the first message
+                        // arrives (mask 0/undefined), show all four.
+                        ].filter(w => {
+                            const mask = wheelTicks.valid_wheels ?? 0;
+                            return mask === 0 || (mask & w.validMask) !== 0;
+                        }).map(w => {
                             const valid = ((wheelTicks.valid_wheels ?? 0) & w.validMask) !== 0;
                             return (
                                 <Col key={w.label} xs={12} md={6}>
@@ -1370,10 +1698,10 @@ export const DiagnosticsPage = () => {
                                     <Typography.Text type="secondary" style={{fontSize: 11}}>
                                         {valid ? (
                                             <>
-                                                {(w.ticks ?? 0).toLocaleString()} ticks · {w.dir === 1 ? '↑ forward' : '↓ reverse'}
+                                                {t('diagnosticsPage.ticksWithDirection', {ticks: (w.ticks ?? 0).toLocaleString(), direction: w.dir === 1 ? t('diagnosticsPage.directionForward') : t('diagnosticsPage.directionReverse')})}
                                             </>
                                         ) : (
-                                            'no encoder reading'
+                                            t('diagnosticsPage.noEncoderReading')
                                         )}
                                     </Typography.Text>
                                 </Col>
@@ -1381,36 +1709,43 @@ export const DiagnosticsPage = () => {
                         })}
                     </Row>
                     {wheelTicks.wheel_tick_factor != null && (
-                        <Typography.Paragraph type="secondary" style={{fontSize: 11, marginTop: 12, marginBottom: 0}}>
-                            Tick factor: <Typography.Text code>{wheelTicks.wheel_tick_factor.toFixed(2)}</Typography.Text> ticks/m at the wheel.
-                            Body omega from L/R diff: <Typography.Text code>{wheelRpm.bodyOmega.toFixed(3)}</Typography.Text> rad/s.
-                            <br/>
-                            Per-wheel motor temperatures + currents are not exposed by the firmware; only the blade motor reports those (see Hardware Status below).
+                    <Typography.Paragraph type="secondary" style={{fontSize: 11, marginTop: 12, marginBottom: 0}}>
+                        {t('diagnosticsPage.tickFactorLabel')}{" "}
+                        <Typography.Text code>{wheelTicks.wheel_tick_factor.toFixed(3)}</Typography.Text>{" "}
+                        {t('diagnosticsPage.tickFactorUnit')}
+                        {" "}
+                        {t('diagnosticsPage.bodyOmegaLabel')}{" "}
+                        <Typography.Text code>{wheelRpm.bodyOmega.toFixed(3)}</Typography.Text>{" "}
+                        rad/s.
+                        <br/>
+                            {t('diagnosticsPage.perWheelTempNote')}
                         </Typography.Paragraph>
                     )}
                 </Card>
             </Col>
             <Col span={24}>
-                <Card title={<Space><SoundOutlined/> Hardware Status</Space>} size="small">
+                <Card title={<Space><SoundOutlined/> {t('diagnosticsPage.hardwareStatus')}</Space>} size="small">
                     <Row gutter={[12, 8]}>
                         <Col xs={12} lg={4}>
                             <Statistic
-                                title="Mower Status"
-                                value={status.mower_status === 255 ? "OK" : "Initializing"}
+                                title={t('diagnosticsPage.mowerStatus')}
+                                value={status.mower_status === 255 ? t('diagnosticsPage.statusOk') : t('diagnosticsPage.initializing')}
                                 valueStyle={{color: status.mower_status === 255 ? undefined : colors.warning}}
                             />
                         </Col>
                         <Col xs={12} lg={4}>
                             <Statistic
-                                title="Rain"
-                                value={status.rain_detected ? "Detected" : "None"}
+                                title={t('diagnosticsPage.rain')}
+                                value={status.rain_detected ? t('diagnosticsPage.detected') : t('diagnosticsPage.none')}
                                 valueStyle={{color: status.rain_detected ? colors.warning : undefined}}
                             />
                         </Col>
                         <Col xs={12} lg={4}>
                             <Statistic
-                                title="ESC Status"
-                                value={(ESC_STATUS[status.mower_esc_status ?? 0] ?? {label: `Unknown (${status.mower_esc_status})`}).label}
+                                title={t('diagnosticsPage.escStatus')}
+                                value={ESC_STATUS[status.mower_esc_status ?? 0]
+                                    ? t(ESC_STATUS[status.mower_esc_status ?? 0].labelKey)
+                                    : t('diagnosticsPage.escUnknown', {code: status.mower_esc_status})}
                                 valueStyle={{
                                     color: ESC_STATUS[status.mower_esc_status ?? 0]?.color === "error" ? colors.danger
                                         : ESC_STATUS[status.mower_esc_status ?? 0]?.color === "warning" ? colors.warning
@@ -1419,21 +1754,21 @@ export const DiagnosticsPage = () => {
                             />
                         </Col>
                         <Col xs={12} lg={4}>
-                            <Statistic title="ESC Temp" value={status.mower_esc_temperature} precision={1} suffix="°C"/>
+                            <Statistic title={t('diagnosticsPage.escTemp')} value={status.mower_esc_temperature} precision={1} suffix="°C"/>
                         </Col>
                         <Col xs={12} lg={4}>
-                            <Statistic title="Motor Temp" value={status.mower_motor_temperature} precision={1} suffix="°C"/>
+                            <Statistic title={t('diagnosticsPage.motorTemp')} value={status.mower_motor_temperature} precision={1} suffix="°C"/>
                         </Col>
                         <Col xs={12} lg={4}>
-                            <Statistic title="Motor RPM" value={status.mower_motor_rpm} precision={0}/>
+                            <Statistic title={t('diagnosticsPage.motorRpm')} value={status.mower_motor_rpm} precision={0}/>
                         </Col>
                     </Row>
                     <Flex wrap gap="small" style={{marginTop: 12}}>
-                        <Tag color={status.raspberry_pi_power ? "success" : "default"}>RPi Power</Tag>
-                        <Tag color={status.esc_power ? "success" : "default"}>ESC Power</Tag>
-                        <Tag color={status.ui_board_available ? "success" : "default"}>UI Board</Tag>
-                        <Tag color={status.sound_module_available ? "success" : "default"}>Sound Module</Tag>
-                        <Tag color={status.mow_enabled ? "success" : "default"}>Mow Enabled</Tag>
+                        <BoolStatusTag label={t('diagnosticsPage.rpiPower')} ok={!!status.raspberry_pi_power}/>
+                        <BoolStatusTag label={t('diagnosticsPage.escPower')} ok={!!status.esc_power}/>
+                        <BoolStatusTag label={t('diagnosticsPage.uiBoard')} ok={!!status.ui_board_available}/>
+                        <BoolStatusTag label={t('diagnosticsPage.soundModule')} ok={!!status.sound_module_available}/>
+                        <BoolStatusTag label={t('diagnosticsPage.mowEnabled')} ok={!!status.mow_enabled}/>
                     </Flex>
                 </Card>
             </Col>
@@ -1443,9 +1778,9 @@ export const DiagnosticsPage = () => {
     // ── Section 5: ROS Diagnostics ───────────────────────────────────────────
 
     const sectionRosDiagnostics = (
-        <Card title="ROS Diagnostics" size="small">
+        <Card title={t('diagnosticsPage.rosDiagnostics')} size="small">
             {(diagnostics.status ?? []).length === 0 ? (
-                <Typography.Text type="secondary">No diagnostic messages received.</Typography.Text>
+                <Typography.Text type="secondary">{t('diagnosticsPage.noDiagnosticMessages')}</Typography.Text>
             ) : (
                 <Collapse
                     size="small"
@@ -1455,7 +1790,7 @@ export const DiagnosticsPage = () => {
                         label: (
                             <Space>
                                 <Tag color={DIAG_LEVEL_COLORS[item.level] ?? "default"}>
-                                    {DIAG_LEVEL_LABELS[item.level] ?? String(item.level)}
+                                    {DIAG_LEVEL_LABEL_KEYS[item.level] ? t(DIAG_LEVEL_LABEL_KEYS[item.level]) : String(item.level)}
                                 </Tag>
                                 <Typography.Text style={{fontSize: 13}}>{item.name}</Typography.Text>
                                 <Typography.Text type="secondary" style={{fontSize: 12}}>{item.message}</Typography.Text>
@@ -1471,7 +1806,7 @@ export const DiagnosticsPage = () => {
                                 ))}
                             </div>
                         ) : (
-                            <Typography.Text type="secondary" style={{fontSize: 12}}>No key-value pairs.</Typography.Text>
+                            <Typography.Text type="secondary" style={{fontSize: 12}}>{t('diagnosticsPage.noKeyValuePairs')}</Typography.Text>
                         ),
                     }))}
                 />
@@ -1481,19 +1816,44 @@ export const DiagnosticsPage = () => {
 
     // ── Section 6: Alerts ────────────────────────────────────────────────────
 
-    const sectionAlerts = alerts.length > 0 ? (
-        <Card title={<Space><WarningOutlined/> Alerts</Space>} size="small">
-            <Space direction="vertical" style={{width: "100%"}}>
-                {alerts.map((item, idx) => (
-                    <Alert
-                        key={idx}
-                        type={item.level === 2 ? "error" : item.level === 3 ? "info" : "warning"}
-                        message={item.name}
-                        description={item.message}
-                        showIcon
-                    />
-                ))}
-            </Space>
+    // Alerts collapse to one row per source component (a GNSS hiccup emits
+    // 8 related messages at once — stacking them pushed the actual
+    // diagnostics content below the fold).
+    const sectionAlerts = alertGroups.length > 0 ? (
+        <Card title={<Space><WarningOutlined/> {t('diagnosticsPage.alerts')}</Space>} size="small">
+            <Collapse
+                size="small"
+                ghost
+                items={alertGroups.map(group => ({
+                    key: group.component,
+                    label: (
+                        <Space>
+                            <Tag color={group.worstLevel === 2 ? "error" : group.worstLevel === 3 ? "default" : "warning"}>
+                                {group.worstLevel === 2 ? t('diagnosticsPage.diagLevelError')
+                                    : group.worstLevel === 3 ? t('diagnosticsPage.diagLevelStale')
+                                    : t('diagnosticsPage.diagLevelWarn')}
+                            </Tag>
+                            <Typography.Text style={{fontSize: 13}}>{group.component}</Typography.Text>
+                            <Typography.Text type="secondary" style={{fontSize: 12}}>
+                                {t('diagnosticsPage.alertGroupCount', {count: group.items.length})}
+                            </Typography.Text>
+                        </Space>
+                    ),
+                    children: (
+                        <Space direction="vertical" style={{width: "100%"}}>
+                            {group.items.map((item, idx) => (
+                                <Alert
+                                    key={idx}
+                                    type={item.level === 2 ? "error" : item.level === 3 ? "info" : "warning"}
+                                    message={item.name}
+                                    description={item.message}
+                                    showIcon
+                                />
+                            ))}
+                        </Space>
+                    ),
+                }))}
+            />
         </Card>
     ) : null;
 
@@ -1502,6 +1862,7 @@ export const DiagnosticsPage = () => {
     if (isMobile) {
         return (
             <div style={{display: "flex", flexDirection: "column", gap: 12, paddingBottom: 8}}>
+                {healthHero}
                 {healthBar}
                 {sectionAlerts}
                 <Collapse
@@ -1510,47 +1871,52 @@ export const DiagnosticsPage = () => {
                     items={[
                         {
                             key: "system",
-                            label: <Space><CloudServerOutlined/> System</Space>,
+                            label: <Space><CloudServerOutlined/> {t('diagnosticsPage.tabSystem')}</Space>,
                             children: sectionSystem,
                         },
                         {
                             key: "localization",
-                            label: <Space><CompassOutlined/> Localization</Space>,
+                            label: <Space><CompassOutlined/> {t('diagnosticsPage.tabLocalization')}</Space>,
                             children: sectionLocalization,
                         },
                         {
                             key: "fusion_graph",
-                            label: <Space><CompassOutlined/> Fusion Graph</Space>,
+                            label: <Space><CompassOutlined/> {t('diagnosticsPage.fusionGraphShort')}</Space>,
                             children: sectionFusionGraph,
                         },
                         {
                             key: "heading_sources",
-                            label: <Space><CompassOutlined/> Heading sources</Space>,
+                            label: <Space><CompassOutlined/> {t('diagnosticsPage.headingSourcesShort')}</Space>,
                             children: sectionHeadingSources,
                         },
                         {
                             key: "bt",
-                            label: <Space><ApiOutlined/> BT State & Coverage</Space>,
+                            label: <Space><ApiOutlined/> {t('diagnosticsPage.btStateAndCoverage')}</Space>,
                             children: sectionBtCoverage,
                         },
                         {
                             key: "cross_checks",
-                            label: "Configuration Cross-checks",
+                            label: t('diagnosticsPage.configurationCrossChecks'),
                             children: sectionCrossChecks,
                         },
                         {
                             key: "calibration_status",
-                            label: "Calibration status",
+                            label: t('diagnosticsPage.calibrationStatus'),
                             children: sectionCalibrationStatus,
                         },
                         {
                             key: "sensors",
-                            label: <Space><ThunderboltOutlined/> Sensors</Space>,
+                            label: <Space><ThunderboltOutlined/> {t('diagnosticsPage.sensors')}</Space>,
                             children: sectionSensors,
                         },
                         {
+                            key: "rosbag",
+                            label: <Space><VideoCameraOutlined/> {t('diagnosticsPage.rosbagTitle')}</Space>,
+                            children: sectionRosbag,
+                        },
+                        {
                             key: "ros",
-                            label: "ROS Diagnostics",
+                            label: t('diagnosticsPage.rosDiagnostics'),
                             children: sectionRosDiagnostics,
                         },
                     ]}
@@ -1565,15 +1931,16 @@ export const DiagnosticsPage = () => {
     const tabItems = [
         {
             key: "system",
-            label: <Space><CloudServerOutlined/> System</Space>,
+            label: <Space><CloudServerOutlined/> {t('diagnosticsPage.tabSystem')}</Space>,
             children: <Space direction="vertical" size="middle" style={{width: "100%"}}>
                 {sectionSystem}
+                {sectionRosbag}
                 {sectionRosDiagnostics}
             </Space>,
         },
         {
             key: "localization",
-            label: <Space><CompassOutlined/> Localization</Space>,
+            label: <Space><CompassOutlined/> {t('diagnosticsPage.tabLocalization')}</Space>,
             children: <Space direction="vertical" size="middle" style={{width: "100%"}}>
                 {sectionLocalization}
                 {sectionFusionGraph}
@@ -1582,7 +1949,7 @@ export const DiagnosticsPage = () => {
         },
         {
             key: "robot",
-            label: <Space><ApiOutlined/> Robot</Space>,
+            label: <Space><ApiOutlined/> {t('diagnosticsPage.tabRobot')}</Space>,
             children: <Space direction="vertical" size="middle" style={{width: "100%"}}>
                 {sectionBtCoverage}
                 {sectionSensors}
@@ -1590,7 +1957,7 @@ export const DiagnosticsPage = () => {
         },
         {
             key: "calibration",
-            label: <Space><CompassOutlined/> Calibration</Space>,
+            label: <Space><CompassOutlined/> {t('diagnosticsPage.tabCalibration')}</Space>,
             children: <Space direction="vertical" size="middle" style={{width: "100%"}}>
                 {sectionCrossChecks}
                 {sectionCalibrationStatus}
@@ -1600,6 +1967,7 @@ export const DiagnosticsPage = () => {
 
     return (
         <Space direction="vertical" size="middle" style={{width: "100%"}}>
+            {healthHero}
             {healthBar}
             {sectionAlerts}
             <Tabs defaultActiveKey="system" items={tabItems} size="large"/>

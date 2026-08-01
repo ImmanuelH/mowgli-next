@@ -1,5 +1,6 @@
 import {App, Input, Select, Space} from "antd";
 import {useEffect, useMemo, useRef, useState} from "react";
+import {useTranslation} from "react-i18next";
 import AsyncButton from "../components/AsyncButton.tsx";
 import {useWS} from "../hooks/useWS.ts";
 import {useApi} from "../hooks/useApi.ts";
@@ -29,11 +30,11 @@ interface ParsedLog {
 }
 
 const LEVEL_OPTIONS: { value: Severity; label: string }[] = [
-    {value: 'ERROR', label: 'Errors'},
-    {value: 'WARN', label: 'Warnings'},
-    {value: 'INFO', label: 'Info'},
-    {value: 'DEBUG', label: 'Debug'},
-    {value: 'OTHER', label: 'Other'},
+    {value: 'ERROR', label: 'logsPage.levelErrors'},
+    {value: 'WARN', label: 'logsPage.levelWarnings'},
+    {value: 'INFO', label: 'logsPage.levelInfo'},
+    {value: 'DEBUG', label: 'logsPage.levelDebug'},
+    {value: 'OTHER', label: 'logsPage.levelOther'},
 ];
 
 const DEFAULT_LEVELS: Severity[] = ['ERROR', 'WARN', 'INFO', 'OTHER'];
@@ -42,6 +43,7 @@ const MAX_LINES = 5000;
 type ContainerList = { value: string, label: string, status: "started" | "stopped", labels: Record<string, string> };
 
 export const LogsPage = () => {
+    const {t} = useTranslation();
     const {colors} = useThemeMode();
     const guiApi = useApi();
     const {notification} = App.useApp();
@@ -54,9 +56,19 @@ export const LogsPage = () => {
     const [autoScroll, setAutoScroll] = useState(true);
     const nextIdRef = useRef(0);
     const listRef = useRef<HTMLDivElement | null>(null);
+    // useWS.onClose fires for BOTH server-side drops and our own stop()/container
+    // switches. Flag the deliberate ones so we don't surface an error toast for
+    // an intentional stop or a container change.
+    const intentionalStopRef = useRef(false);
 
     const stream = useWS<string>(
-        () => { notification.error({message: "Logs stream closed"}); },
+        () => {
+            if (intentionalStopRef.current) {
+                intentionalStopRef.current = false;
+                return;
+            }
+            notification.error({message: t('logsPage.streamClosed')});
+        },
         () => { /* connected */ },
         (line, first) => {
             setLogs(prev => {
@@ -90,7 +102,7 @@ export const LogsPage = () => {
             if (options?.length && !containerId) setContainerId(options[0].value);
         } catch (e: unknown) {
             notification.error({
-                message: "Failed to list containers",
+                message: t('logsPage.failedToListContainers'),
                 description: e instanceof Error ? e.message : String(e),
             });
         }
@@ -103,11 +115,16 @@ export const LogsPage = () => {
         nextIdRef.current = 0;
         setLogs([]);
         stream.start(`/api/containers/${containerId}/logs`);
-        return () => { stream?.stop(); };
+        // Switching containers (or unmounting) closes the socket on purpose.
+        return () => { intentionalStopRef.current = true; stream?.stop(); };
     }, [containerId]);
 
     const commandContainer = (command: "start" | "stop" | "restart") => async () => {
-        const messages = {start: "Container started", stop: "Container stopped", restart: "Container restarted"};
+        const messages = {
+            start: t('logsPage.containerStarted'),
+            stop: t('logsPage.containerStopped'),
+            restart: t('logsPage.containerRestarted'),
+        };
         try {
             if (!containerId) return;
             const res = await guiApi.containers.containersCreate(containerId, command);
@@ -115,13 +132,15 @@ export const LogsPage = () => {
             if (command === "start" || command === "restart") {
                 stream.start(`/api/containers/${containerId}/logs`);
             } else {
+                // Stopping the container intentionally closes the stream.
+                intentionalStopRef.current = true;
                 stream?.stop();
             }
             await listContainers();
             notification.success({message: messages[command]});
         } catch (e: unknown) {
             notification.error({
-                message: `Failed to ${command} container`,
+                message: t('logsPage.failedToCommandContainer', {command}),
                 description: e instanceof Error ? e.message : String(e),
             });
         }
@@ -145,11 +164,15 @@ export const LogsPage = () => {
         return c;
     }, [logs]);
 
+    // Once the buffer hits MAX_LINES, filtered.length plateaus even as new
+    // lines keep arriving, so an effect keyed on it stops firing and autoscroll
+    // dies. Key on the last line's monotonic id, which always advances.
+    const lastLineId = filtered.length > 0 ? filtered[filtered.length - 1].id : -1;
     useEffect(() => {
         if (!autoScroll) return;
         const el = listRef.current;
         if (el) el.scrollTop = el.scrollHeight;
-    }, [filtered.length, autoScroll]);
+    }, [lastLineId, autoScroll]);
 
     const handleScroll = () => {
         const el = listRef.current;
@@ -181,21 +204,21 @@ export const LogsPage = () => {
                     value={containerId}
                     style={{flex: 1, minWidth: isMobile ? undefined : 200}}
                     onSelect={(value) => setContainerId(value)}
-                    placeholder="Select container"
+                    placeholder={t('logsPage.selectContainer')}
                 />
                 <Space size={8} style={{flexShrink: 0}}>
                     {selectedContainer?.status === "started" && (
                         <>
-                            <AsyncButton onAsyncClick={commandContainer("restart")} size={isMobile ? "middle" : "small"}>Restart</AsyncButton>
+                            <AsyncButton onAsyncClick={commandContainer("restart")} size={isMobile ? "middle" : "small"}>{t('logsPage.restart')}</AsyncButton>
                             <AsyncButton
                                 disabled={selectedContainer.labels.app === "gui"}
                                 onAsyncClick={commandContainer("stop")}
                                 size={isMobile ? "middle" : "small"}
-                            >Stop</AsyncButton>
+                            >{t('logsPage.stop')}</AsyncButton>
                         </>
                     )}
                     {selectedContainer?.status === "stopped" && (
-                        <AsyncButton onAsyncClick={commandContainer("start")} size={isMobile ? "middle" : "small"}>Start</AsyncButton>
+                        <AsyncButton onAsyncClick={commandContainer("start")} size={isMobile ? "middle" : "small"}>{t('logsPage.start')}</AsyncButton>
                     )}
                 </Space>
             </div>
@@ -208,7 +231,7 @@ export const LogsPage = () => {
                 flexWrap: 'wrap',
             }}>
                 <Input.Search
-                    placeholder="Search logs..."
+                    placeholder={t('logsPage.searchPlaceholder')}
                     value={search}
                     onChange={(e) => setSearch(e.target.value)}
                     allowClear
@@ -235,7 +258,7 @@ export const LogsPage = () => {
                                 }}
                                 aria-pressed={active}
                             >
-                                {opt.label} <span style={{opacity: 0.7, marginLeft: 4}}>{counts[opt.value]}</span>
+                                {t(opt.label)} <span style={{opacity: 0.7, marginLeft: 4}}>{counts[opt.value]}</span>
                             </button>
                         );
                     })}
@@ -251,7 +274,7 @@ export const LogsPage = () => {
                             cursor: 'pointer',
                         }}
                     >
-                        {autoScroll ? '↓ Live' : '↓ Paused'}
+                        {autoScroll ? `↓ ${t('logsPage.live')}` : `↓ ${t('logsPage.paused')}`}
                     </button>
                     <button
                         onClick={() => { setLogs([]); nextIdRef.current = 0; }}
@@ -260,7 +283,7 @@ export const LogsPage = () => {
                             border: `1px solid ${colors.border}`, background: 'transparent',
                             color: colors.textDim, cursor: 'pointer',
                         }}
-                    >Clear</button>
+                    >{t('logsPage.clear')}</button>
                 </div>
             </div>
 
@@ -278,7 +301,7 @@ export const LogsPage = () => {
             >
                 {filtered.length === 0 && (
                     <div style={{padding: '40px 16px', textAlign: 'center', color: colors.textMuted}}>
-                        {logs.length === 0 ? 'Waiting for log output...' : 'No lines match the active filters.'}
+                        {logs.length === 0 ? t('logsPage.waitingForOutput') : t('logsPage.noLinesMatch')}
                     </div>
                 )}
                 {filtered.map(line => {

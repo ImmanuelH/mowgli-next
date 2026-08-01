@@ -3,7 +3,7 @@
 
 # ── Global configuration ────────────────────────────────────────────────────
 
-REPO_URL="https://github.com/cedbossneo/mowglinext.git"
+REPO_URL="https://github.com/mowglinext/mowglinext.git"
 
 # Fork-local override (gitignored). Create install/lib/config.local.sh to
 # point at your own fork without touching tracked files:
@@ -13,12 +13,12 @@ _config_local="${BASH_SOURCE[0]%/*}/config.local.sh"
 [[ -f "$_config_local" ]] && source "$_config_local"
 unset _config_local
 
-REPO_BRANCH="main"
-# IMAGE_TAG selects which GHCR image channel to pull. "main" = stable
-# (built from the main branch), "dev" = iteration channel (built from
-# dev). Can be overridden from docker/.env, a preset, or `--branch=` on
-# the CLI. recompute_image_defaults() rebuilds the *_IMAGE_DEFAULT vars
-# from the live IMAGE_TAG.
+REPO_BRANCH="${REPO_BRANCH:-}"
+# IMAGE_TAG selects which GHCR image tag to pull. "main" = stable,
+# "dev" = integration, and feature branches can use custom tags such as
+# "feat-universal-gnss-integration". Can be overridden from docker/.env,
+# a preset, or `--image-tag=` on the CLI. recompute_image_defaults()
+# rebuilds the *_IMAGE_DEFAULT vars from the live IMAGE_TAG.
 IMAGE_TAG="${IMAGE_TAG:-main}"
 REPO_DIR="${MOWGLI_HOME:-$HOME/mowglinext}"
 DOCKER_SUBDIR="install"
@@ -41,28 +41,168 @@ _ghcr_prefix() {
 recompute_image_defaults() {
   local prefix
   prefix="$(_ghcr_prefix)"
+
   MOWGLI_ROS2_IMAGE_DEFAULT="${prefix}/mowgli-ros2:${IMAGE_TAG}"
   GPS_IMAGE_DEFAULT="${prefix}/gps:${IMAGE_TAG}"
-  UNICORE_IMAGE_DEFAULT="${prefix}/unicore:${IMAGE_TAG}"
   LIDAR_LDLIDAR_IMAGE_DEFAULT="${prefix}/lidar-ldlidar:${IMAGE_TAG}"
   LIDAR_RPLIDAR_IMAGE_DEFAULT="${prefix}/lidar-rplidar:${IMAGE_TAG}"
   LIDAR_STL27L_IMAGE_DEFAULT="${prefix}/lidar-stl27l:${IMAGE_TAG}"
   MAVROS_IMAGE_DEFAULT="${prefix}/mavros:${IMAGE_TAG}"
-  NMEA_IMAGE_DEFAULT="${prefix}/nmea:${IMAGE_TAG}"
   GUI_IMAGE_DEFAULT="${prefix}/mowglinext-gui:${IMAGE_TAG}"
 }
 
-is_valid_image_tag() {
+is_release_image_channel() {
   case "${1:-}" in
     main|dev) return 0 ;;
     *) return 1 ;;
   esac
 }
 
+sanitize_image_tag() {
+  local raw="${1:-}"
+
+  raw="${raw#refs/heads/}"
+  raw="${raw#origin/}"
+  raw="${raw,,}"
+  raw="$(printf '%s' "$raw" | sed -E 's/[^a-z0-9_.-]+/-/g; s/^[.-]+//; s/[.-]+$//; s/-+/-/g')"
+  raw="${raw:0:128}"
+  raw="$(printf '%s' "$raw" | sed -E 's/^[.-]+//; s/[.-]+$//')"
+  [ -n "$raw" ] || raw="current"
+
+  printf '%s\n' "$raw"
+}
+
+is_valid_image_tag() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]
+}
+
+current_repo_branch_name() {
+  local repo_dir="${1:-$REPO_DIR}"
+
+  [ -d "$repo_dir/.git" ] || return 1
+  git -C "$repo_dir" symbolic-ref --quiet --short HEAD 2>/dev/null
+}
+
+default_repo_branch_name() {
+  current_repo_branch_name "$REPO_DIR" 2>/dev/null || printf 'main\n'
+}
+
+normalize_repo_branch_name() {
+  local raw="${1:-}"
+
+  raw="${raw#refs/heads/}"
+  raw="${raw#origin/}"
+  printf '%s\n' "$raw"
+}
+
+resolve_repo_branch_spec() {
+  local spec="${1:-}"
+  local current_branch
+
+  case "$spec" in
+    ""|current|current-branch|current_branch|keep)
+      current_branch="$(current_repo_branch_name "$REPO_DIR" 2>/dev/null || true)"
+      [ -n "$current_branch" ] || return 1
+      printf '%s\n' "$current_branch"
+      return 0
+      ;;
+  esac
+
+  spec="$(normalize_repo_branch_name "$spec")"
+  [ -n "$spec" ] || return 1
+  printf '%s\n' "$spec"
+}
+
+resolve_image_tag_spec() {
+  local spec="${1:-}"
+  local current_branch
+
+  case "$spec" in
+    ""|current|current-branch|current_branch)
+      current_branch="$(current_repo_branch_name "$REPO_DIR" 2>/dev/null || true)"
+      [ -n "$current_branch" ] || return 1
+      printf '%s\n' "$(sanitize_image_tag "$current_branch")"
+      return 0
+      ;;
+  esac
+
+  if is_valid_image_tag "$spec"; then
+    printf '%s\n' "$spec"
+    return 0
+  fi
+
+  spec="$(sanitize_image_tag "$spec")"
+  if is_valid_image_tag "$spec"; then
+    printf '%s\n' "$spec"
+    return 0
+  fi
+
+  return 1
+}
+
+if [[ -z "${REPO_BRANCH:-}" ]]; then
+  REPO_BRANCH="$(default_repo_branch_name)"
+fi
+
+select_repo_branch() {
+  if [[ "${REPO_BRANCH_PRESET:-false}" == "true" ]]; then
+    info "Repository branch pre-selected: ${REPO_BRANCH}"
+    return 0
+  fi
+
+  if [ ! -d "$REPO_DIR/.git" ]; then
+    return 0
+  fi
+
+  local current_branch current_ref previous requested_branch
+  current_branch="$(current_repo_branch_name "$REPO_DIR" 2>/dev/null || true)"
+  current_ref="$(repo_current_ref "$REPO_DIR" 2>/dev/null || true)"
+  previous="${REPO_BRANCH:-${current_branch:-main}}"
+
+  echo ""
+  echo -e "${CYAN:-}${BOLD:-}Repository branch${NC:-}"
+  if [[ -n "$current_branch" ]]; then
+    echo "  1) keep current checkout — ${current_branch} (default)"
+  else
+    echo "  1) keep current checkout — detached HEAD (${current_ref}) (default)"
+  fi
+  echo "  2) main"
+  echo "  3) dev"
+  echo "  4) custom branch"
+  echo ""
+  prompt "Choose" "1"
+
+  case "$REPLY" in
+    1|keep|current)
+      REPO_BRANCH="${current_branch:-$previous}"
+      ;;
+    2|main)
+      REPO_BRANCH="main"
+      ;;
+    3|dev)
+      REPO_BRANCH="dev"
+      ;;
+    4|custom)
+      prompt "Repository branch" "$previous"
+      requested_branch="${REPLY:-$previous}"
+      if ! REPO_BRANCH="$(resolve_repo_branch_spec "$requested_branch")"; then
+        warn "Invalid repository branch '$requested_branch', keeping ${previous}"
+        REPO_BRANCH="$previous"
+      fi
+      ;;
+    *)
+      warn "Invalid choice, keeping ${previous}"
+      REPO_BRANCH="$previous"
+      ;;
+  esac
+
+  info "Repository branch: ${REPO_BRANCH}"
+}
+
 select_image_channel() {
-  # --branch= flag wins. Preset files (web composer) can also pin IMAGE_TAG.
+  # --image-tag= flag wins. Preset files (web composer) can also pin IMAGE_TAG.
   if [[ "${IMAGE_CHANNEL_PRESET:-false}" == "true" ]]; then
-    info "Image channel pre-selected: ${IMAGE_TAG}"
+    info "Image tag pre-selected: ${IMAGE_TAG}"
     recompute_image_defaults
     return 0
   fi
@@ -71,12 +211,14 @@ select_image_channel() {
     && [ "${STATE_ACTIVE_PRESET_COUNT:-0}" -gt 0 ] \
     && declare -F preset_key_loaded >/dev/null \
     && preset_key_loaded IMAGE_TAG; then
-    info "Image channel pre-selected from preset: ${IMAGE_TAG}"
+    info "Image tag pre-selected from preset: ${IMAGE_TAG}"
     recompute_image_defaults
     return 0
   fi
 
   local previous="${IMAGE_TAG:-main}"
+  local current_branch=""
+  local current_branch_tag=""
   # If IMAGE_TAG isn't recorded in .env but image refs are, infer the channel
   # from those — otherwise upgrading users who already pulled :dev would get
   # silently flipped to :main just because the new key didn't exist yet.
@@ -88,25 +230,61 @@ select_image_channel() {
     fi
   fi
 
+  current_branch="$(current_repo_branch_name "$REPO_DIR" 2>/dev/null || true)"
+  if [[ -n "$current_branch" && "$current_branch" != "main" && "$current_branch" != "dev" ]]; then
+    current_branch_tag="$(sanitize_image_tag "$current_branch")"
+  fi
+
+  if [[ -n "$current_branch_tag" ]] && { is_release_image_channel "$previous" || [[ -z "$previous" ]]; }; then
+    previous="$current_branch_tag"
+  fi
+
   echo ""
-  echo -e "${CYAN:-}${BOLD:-}Image channel${NC:-}"
-  echo "  1) main — stable images built from the main branch (default)"
-  echo "  2) dev  — iteration channel built from the dev branch"
+  echo -e "${CYAN:-}${BOLD:-}Image tag${NC:-}"
+  echo "  1) main — stable published images"
+  echo "  2) dev  — integration images"
+  if [[ -n "$current_branch_tag" ]]; then
+    echo "  3) current branch / custom tag — keep checkout ${current_branch} (default tag: ${current_branch_tag})"
+  else
+    echo "  3) custom tag — keep the current checkout and choose an explicit image tag"
+  fi
   echo ""
   local default_choice="1"
   [[ "$previous" == "dev" ]] && default_choice="2"
+  if ! is_release_image_channel "$previous"; then
+    default_choice="3"
+  fi
   prompt "Choose" "$default_choice"
 
   case "$REPLY" in
     1|main) IMAGE_TAG="main" ;;
     2|dev)  IMAGE_TAG="dev" ;;
+    3|current|custom)
+      local custom_default="$previous"
+      local requested_tag
+
+      if is_release_image_channel "$custom_default"; then
+        custom_default="${current_branch_tag:-$custom_default}"
+      fi
+      [ -n "$custom_default" ] || custom_default="main"
+
+      prompt "Image tag" "$custom_default"
+      requested_tag="${REPLY:-$custom_default}"
+      if ! IMAGE_TAG="$(resolve_image_tag_spec "$requested_tag")"; then
+        warn "Invalid image tag '$requested_tag', keeping ${previous}"
+        IMAGE_TAG="$previous"
+      fi
+      ;;
     *)
       warn "Invalid choice, keeping ${previous}"
       IMAGE_TAG="$previous"
       ;;
   esac
 
-  info "Image channel: ${IMAGE_TAG}"
+  info "Image tag: ${IMAGE_TAG}"
+  if [[ -n "$current_branch" && "$current_branch" != "$IMAGE_TAG" ]]; then
+    info "Repository checkout stays on ${current_branch}; only container images use tag ${IMAGE_TAG}."
+  fi
   recompute_image_defaults
 }
 
@@ -114,6 +292,19 @@ recompute_image_defaults
 
 CHECK_ONLY=false
 CLI_PRESET=false
+GNSS_RECEIVER_FAMILY_CLI_PRESET=false
+GNSS_CONNECTION_CLI_PRESET=false
+GNSS_SERIAL_DEVICE_CLI_PRESET=false
+GNSS_SERIAL_BAUD_CLI_PRESET=false
+GNSS_FRAME_ID_CLI_PRESET=false
+GNSS_NTRIP_GGA_ENABLED_CLI_PRESET=false
+GNSS_NTRIP_GGA_INTERVAL_S_CLI_PRESET=false
+CONFIG_NTRIP_ENABLED_EXPLICIT=false
+CONFIG_NTRIP_HOST_EXPLICIT=false
+CONFIG_NTRIP_PORT_EXPLICIT=false
+CONFIG_NTRIP_USER_EXPLICIT=false
+CONFIG_NTRIP_PASSWORD_EXPLICIT=false
+CONFIG_NTRIP_MOUNTPOINT_EXPLICIT=false
 
 installer_main_command() {
   printf 'bash %q' "$REPO_DIR/install/mowglinext.sh"
@@ -131,10 +322,12 @@ compose_restart_services_for_backend() {
     services+=(mavros ntrip mowgli)
   else
     local gnss_backend
+    local gnss_stack
     local gnss_service
 
     gnss_backend="$(effective_gnss_backend 2>/dev/null || true)"
-    if is_supported_gnss_backend "$gnss_backend"; then
+    gnss_stack="$(effective_gnss_stack 2>/dev/null || true)"
+    if [[ "$gnss_stack" != "disabled" ]] && is_supported_gnss_backend "$gnss_backend"; then
       gnss_service="$(compose_gnss_service_name "$gnss_backend" 2>/dev/null || true)"
       [ -n "$gnss_service" ] && services+=("$gnss_service")
     fi
@@ -262,24 +455,133 @@ warn_legacy_nmea_backend_once() {
     return 0
   fi
 
-  warn "Legacy GNSS_BACKEND=nmea detected — normalizing to GNSS_BACKEND=gps with GPS_PROTOCOL=NMEA."
+  warn "Legacy GNSS_BACKEND=nmea detected — normalizing to Universal GNSS with GNSS_RECEIVER_FAMILY=nmea."
   LEGACY_GNSS_NMEA_WARNING_SHOWN=true
 }
 
 normalize_gnss_backend() {
   local backend="${1:-}"
 
-  if [[ "$backend" == "nmea" ]]; then
-    warn_legacy_nmea_backend_once
-    printf 'gps\n'
+  case "${backend,,}" in
+    ""|universal|gps|ublox|unicore)
+      printf 'universal\n'
+      ;;
+    nmea)
+      warn_legacy_nmea_backend_once
+      printf 'universal\n'
+      ;;
+    legacy)
+      printf 'universal\n'
+      ;;
+    disabled)
+      printf 'disabled\n'
+      ;;
+    *)
+      printf '%s\n' "${backend,,}"
+      ;;
+  esac
+}
+
+normalize_gnss_status_source() {
+  local status_source="${1:-}"
+
+  case "${status_source,,}" in
+    universal)
+      printf 'universal\n'
+      ;;
+    external|disabled|off|false|0)
+      printf 'external\n'
+      ;;
+    legacy|mowgli_local|local|"")
+      printf 'universal\n'
+      ;;
+    *)
+      printf '%s\n' "${status_source,,}"
+      ;;
+  esac
+}
+
+default_gnss_status_source() {
+  if [[ "${HARDWARE_BACKEND:-mowgli}" == "mavros" ]]; then
+    printf 'external\n'
+  else
+    printf 'universal\n'
+  fi
+}
+
+default_gnss_stack() {
+  if [[ "${HARDWARE_BACKEND:-mowgli}" == "mavros" ]]; then
+    printf 'disabled\n'
+  else
+    printf 'universal\n'
+  fi
+}
+
+normalize_gnss_stack() {
+  local stack="${1:-}"
+
+  case "${stack,,}" in
+    "")
+      printf '%s\n' "$(default_gnss_stack)"
+      ;;
+    fallback|legacy)
+      printf 'universal\n'
+      ;;
+    universal|disabled)
+      printf '%s\n' "${stack,,}"
+      ;;
+    *)
+      printf '%s\n' "${stack,,}"
+      ;;
+  esac
+}
+
+normalize_gnss_receiver_family() {
+  local receiver_family="${1:-}"
+
+  case "${receiver_family,,}" in
+    ""|auto)
+      printf 'auto\n'
+      ;;
+    u-blox|ublox)
+      printf 'ublox\n'
+      ;;
+    unicore|nmea)
+      printf '%s\n' "${receiver_family,,}"
+      ;;
+    *)
+      printf '%s\n' "${receiver_family,,}"
+      ;;
+  esac
+}
+
+gnss_connection_from_serial_device() {
+  local serial_device="${1:-${GNSS_SERIAL_DEVICE:-}}"
+  local hinted_connection="${GNSS_CONNECTION_HINT:-}"
+
+  if [[ -n "$serial_device" ]]; then
+    case "$serial_device" in
+      /dev/serial/by-id/*|/dev/ttyACM*|/dev/ttyUSB*)
+        printf 'usb\n'
+        return 0
+        ;;
+      /dev/ttyAMA*|/dev/ttyS*|/dev/ttyTHS*|/dev/ttyHS*)
+        printf 'uart\n'
+        return 0
+        ;;
+    esac
+  fi
+
+  if [[ -n "$hinted_connection" ]]; then
+    printf '%s\n' "${hinted_connection,,}"
     return 0
   fi
 
-  printf '%s\n' "$backend"
+  printf 'uart\n'
 }
 
 list_supported_gnss_backends() {
-  local backends="gps ublox unicore"
+  local backends="universal"
   if [[ "${HARDWARE_BACKEND:-mowgli}" == "mavros" ]]; then
     printf '%s disabled\n' "$backends"
   else
@@ -290,8 +592,8 @@ list_supported_gnss_backends() {
 is_supported_gnss_backend() {
   local backend="${1:-}"
 
-  case "$backend" in
-    gps|ublox|unicore)
+  case "${backend,,}" in
+    universal)
       return 0
       ;;
     disabled)
@@ -305,32 +607,216 @@ is_supported_gnss_backend() {
 }
 
 effective_gnss_backend() {
-  local backend="${1:-${GNSS_BACKEND:-gps}}"
+  local backend="${1:-${GNSS_BACKEND:-universal}}"
+  local stack
 
   backend="$(normalize_gnss_backend "$backend")"
+  stack="$(effective_gnss_stack 2>/dev/null || true)"
 
-  if [[ "${HARDWARE_BACKEND:-mowgli}" == "mavros" ]]; then
+  if [[ "${HARDWARE_BACKEND:-mowgli}" == "mavros" || "$backend" == "disabled" || "$stack" == "disabled" ]]; then
     printf 'disabled\n'
     return 0
   fi
 
-  printf '%s\n' "$backend"
-  is_supported_gnss_backend "$backend"
+  printf 'universal\n'
+  return 0
+}
+
+effective_gnss_stack() {
+  local stack="${1:-${GNSS_STACK:-}}"
+  local status_source
+  local raw_backend
+
+  raw_backend="$(normalize_gnss_backend "${GNSS_BACKEND:-}")"
+
+  if [[ "${HARDWARE_BACKEND:-mowgli}" == "mavros" || "$raw_backend" == "disabled" ]]; then
+    printf 'disabled\n'
+    return 0
+  fi
+
+  if [[ -z "$stack" ]]; then
+    status_source="$(normalize_gnss_status_source "${GNSS_STATUS_SOURCE:-$(default_gnss_status_source)}")"
+    if [[ "$status_source" == "external" ]]; then
+      stack="disabled"
+    else
+      stack="universal"
+    fi
+  fi
+
+  stack="$(normalize_gnss_stack "$stack")"
+  printf '%s\n' "$stack"
+
+  case "$stack" in
+    universal|disabled)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+gnss_receiver_family_from_state() {
+  local receiver_family="${GNSS_RECEIVER_FAMILY:-}"
+
+  if [[ -n "$receiver_family" ]]; then
+    printf '%s\n' "${receiver_family,,}"
+    return 0
+  fi
+
+  printf 'auto\n'
+}
+
+gnss_transport_from_state() {
+  local transport="${GNSS_TRANSPORT:-serial}"
+  printf '%s\n' "${transport,,}"
+}
+
+gnss_serial_device_from_state() {
+  if [[ -n "${GNSS_SERIAL_DEVICE:-}" ]]; then
+    printf '%s\n' "$GNSS_SERIAL_DEVICE"
+    return 0
+  fi
+
+  case "$(gnss_connection_from_serial_device)" in
+    usb)  printf '/dev/serial/by-id/usb-stub\n' ;;
+    *)    printf '/dev/ttyAMA4\n' ;;
+  esac
+}
+
+gnss_serial_baud_from_state() {
+  printf '%s\n' "${GNSS_SERIAL_BAUD:-921600}"
+}
+
+existing_yaml_value() {
+  local key="${1:?existing_yaml_value: missing key}"
+  local yaml_file="${2:-$DOCKER_DIR/config/mowgli/mowgli_robot.yaml}"
+  local line value
+
+  [ -f "$yaml_file" ] || return 0
+
+  line="$(grep -E "^[[:space:]]+${key}:" "$yaml_file" 2>/dev/null | head -1 || true)"
+  value="${line#*:}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%%#*}"
+  value="${value%"${value##*[![:space:]]}"}"
+  value="${value#\"}"
+  value="${value%\"}"
+  value="${value#\'}"
+  value="${value%\'}"
+  printf '%s\n' "$value"
+}
+
+gnss_installer_key_is_explicit() {
+  local key="${1:?gnss_installer_key_is_explicit: missing key}"
+
+  case "$key" in
+    GNSS_RECEIVER_FAMILY)
+      [[ "${GNSS_RECEIVER_FAMILY_CLI_PRESET:-false}" == "true" ]] && return 0
+      ;;
+    GNSS_TRANSPORT)
+      [[ "${GNSS_CONNECTION_CLI_PRESET:-false}" == "true" ]] && return 0
+      ;;
+    GNSS_SERIAL_DEVICE)
+      if [[ "${GNSS_SERIAL_DEVICE_CLI_PRESET:-false}" == "true" \
+        || "${GNSS_CONNECTION_CLI_PRESET:-false}" == "true" ]]; then
+        return 0
+      fi
+      ;;
+    GNSS_SERIAL_BAUD)
+      [[ "${GNSS_SERIAL_BAUD_CLI_PRESET:-false}" == "true" ]] && return 0
+      ;;
+    GNSS_FRAME_ID)
+      [[ "${GNSS_FRAME_ID_CLI_PRESET:-false}" == "true" ]] && return 0
+      ;;
+    GNSS_NTRIP_GGA_ENABLED)
+      [[ "${GNSS_NTRIP_GGA_ENABLED_CLI_PRESET:-false}" == "true" ]] && return 0
+      ;;
+    GNSS_NTRIP_GGA_INTERVAL_S)
+      [[ "${GNSS_NTRIP_GGA_INTERVAL_S_CLI_PRESET:-false}" == "true" ]] && return 0
+      ;;
+  esac
+
+  if declare -F preset_key_loaded >/dev/null 2>&1; then
+    case "$key" in
+      GNSS_RECEIVER_FAMILY|GNSS_TRANSPORT|GNSS_SERIAL_DEVICE|GNSS_SERIAL_BAUD|\
+      GNSS_FRAME_ID|GNSS_NTRIP_GGA_ENABLED|GNSS_NTRIP_GGA_INTERVAL_S)
+        preset_key_loaded "$key" && return 0
+        ;;
+    esac
+  fi
+
+  return 1
+}
+
+preserved_gnss_value() {
+  local explicit="${1:-false}"
+  local current="${2:-}"
+  local previous="${3:-}"
+  local default_value="${4:-}"
+
+  if [[ "$explicit" == "true" ]]; then
+    printf '%s\n' "$current"
+    return 0
+  fi
+
+  if [[ -n "$previous" ]]; then
+    printf '%s\n' "$previous"
+    return 0
+  fi
+
+  if [[ -n "$current" ]]; then
+    printf '%s\n' "$current"
+    return 0
+  fi
+
+  printf '%s\n' "$default_value"
+}
+
+apply_existing_yaml_gnss_state() {
+  local yaml_file="$DOCKER_DIR/config/mowgli/mowgli_robot.yaml"
+  [ -f "$yaml_file" ] || return 0
+
+  local prev_receiver_family prev_transport prev_serial_device prev_serial_baud
+  local prev_frame_id prev_ntrip_gga_enabled prev_ntrip_gga_interval_s
+
+  prev_receiver_family="$(existing_yaml_value gnss_receiver_family "$yaml_file")"
+  prev_transport="$(existing_yaml_value gnss_transport "$yaml_file")"
+  prev_serial_device="$(existing_yaml_value gnss_serial_device "$yaml_file")"
+  prev_serial_baud="$(existing_yaml_value gnss_serial_baud "$yaml_file")"
+  prev_frame_id="$(existing_yaml_value gnss_frame_id "$yaml_file")"
+  prev_ntrip_gga_enabled="$(existing_yaml_value gnss_ntrip_gga_enabled "$yaml_file")"
+  prev_ntrip_gga_interval_s="$(existing_yaml_value gnss_ntrip_gga_interval_s "$yaml_file")"
+
+  if ! gnss_installer_key_is_explicit GNSS_RECEIVER_FAMILY && [[ -n "$prev_receiver_family" ]]; then
+    GNSS_RECEIVER_FAMILY="$prev_receiver_family"
+  fi
+  if ! gnss_installer_key_is_explicit GNSS_TRANSPORT && [[ -n "$prev_transport" ]]; then
+    GNSS_TRANSPORT="$prev_transport"
+  fi
+  if ! gnss_installer_key_is_explicit GNSS_SERIAL_DEVICE && [[ -n "$prev_serial_device" ]]; then
+    GNSS_SERIAL_DEVICE="$prev_serial_device"
+  fi
+  if ! gnss_installer_key_is_explicit GNSS_SERIAL_BAUD && [[ -n "$prev_serial_baud" ]]; then
+    GNSS_SERIAL_BAUD="$prev_serial_baud"
+  fi
+  if ! gnss_installer_key_is_explicit GNSS_FRAME_ID && [[ -n "$prev_frame_id" ]]; then
+    GNSS_FRAME_ID="$prev_frame_id"
+  fi
+  if ! gnss_installer_key_is_explicit GNSS_NTRIP_GGA_ENABLED && [[ -n "$prev_ntrip_gga_enabled" ]]; then
+    GNSS_NTRIP_GGA_ENABLED="$prev_ntrip_gga_enabled"
+  fi
+  if ! gnss_installer_key_is_explicit GNSS_NTRIP_GGA_INTERVAL_S && [[ -n "$prev_ntrip_gga_interval_s" ]]; then
+    GNSS_NTRIP_GGA_INTERVAL_S="$prev_ntrip_gga_interval_s"
+  fi
 }
 
 compose_gnss_service_name() {
   local backend="${1:-$(effective_gnss_backend)}"
 
   case "$backend" in
-    gps|ublox)
-      # ublox merged into the sensors/gps container 2026-05-12. The legacy
-      # libusb-based "gnss_ublox" service was removed because the serial
-      # transport (sensors/gps + start_gps.sh) is the canonical path since
-      # the 2026-04-26 libusb→serial fix (project_gps_serial_transport_fix.md).
+    universal)
       printf 'gps\n'
-      ;;
-    unicore)
-      printf 'gnss_unicore\n'
       ;;
     disabled)
       return 0
@@ -362,25 +848,126 @@ parse_args() {
       --lang=*)
         MOWGLI_LANG="${1#*=}"
         ;;
-      --branch=*|--channel=*|--image-tag=*)
-        local tag_spec="${1#*=}"
-        if ! is_valid_image_tag "$tag_spec"; then
-          error "Unknown image channel: $tag_spec (expected main or dev)"
+      --branch=*)
+        local branch_spec="${1#*=}"
+        if ! REPO_BRANCH="$(resolve_repo_branch_spec "$branch_spec")"; then
+          error "Unknown repository branch: $branch_spec"
           exit 1
         fi
-        IMAGE_TAG="$tag_spec"
+        REPO_BRANCH_PRESET=true
+        ;;
+      --channel=*|--image-tag=*)
+        local tag_spec="${1#*=}"
+        if [[ "$1" == --channel=* ]]; then
+          warn "--channel is deprecated; use --image-tag=<main|dev>."
+          if ! is_release_image_channel "$tag_spec"; then
+            error "Unknown image channel: $tag_spec (expected main or dev)"
+            exit 1
+          fi
+        fi
+        if ! IMAGE_TAG="$(resolve_image_tag_spec "$tag_spec")"; then
+          error "Unknown image tag: $tag_spec (expected main, dev, current, or a custom Docker tag)"
+          exit 1
+        fi
         IMAGE_CHANNEL_PRESET=true
         recompute_image_defaults
         ;;
-      --gnss=*)
+      --backend=*)
         CLI_PRESET=true
-        local gnss_spec="${1#*=}"
-        case "$gnss_spec" in
-          gps|ublox|unicore)
-            GNSS_BACKEND="$gnss_spec"
+        local backend_spec="${1#*=}"
+        case "$backend_spec" in
+          mowgli)
+            HARDWARE_BACKEND="mowgli"
+            MAVROS_BY_ID=""
+            ;;
+          mavros)
+            HARDWARE_BACKEND="mavros"
             ;;
           *)
-            error "Unknown GNSS backend: $gnss_spec (expected gps|ublox|unicore)"
+            error "Unknown hardware backend: $backend_spec (expected mowgli or mavros)"
+            exit 1
+            ;;
+        esac
+        ;;
+      --gnss=*)
+        CLI_PRESET=true
+        GNSS_RECEIVER_FAMILY_CLI_PRESET=true
+        local gnss_spec="${1#*=}"
+        case "$gnss_spec" in
+          auto)
+            GNSS_STACK="universal"
+            GNSS_STATUS_SOURCE="universal"
+            GNSS_BACKEND="universal"
+            GNSS_RECEIVER_FAMILY="auto"
+            ;;
+          gps)
+            GNSS_STACK="${GNSS_STACK:-universal}"
+            GNSS_STATUS_SOURCE="${GNSS_STATUS_SOURCE:-universal}"
+            GNSS_BACKEND="universal"
+            GNSS_RECEIVER_FAMILY="auto"
+            ;;
+          ublox|unicore|nmea)
+            GNSS_STACK="${GNSS_STACK:-universal}"
+            GNSS_STATUS_SOURCE="${GNSS_STATUS_SOURCE:-universal}"
+            GNSS_RECEIVER_FAMILY="$gnss_spec"
+            GNSS_BACKEND="universal"
+            ;;
+          *)
+            error "Unknown GNSS backend: $gnss_spec (expected auto|gps|ublox|unicore|nmea)"
+            exit 1
+            ;;
+        esac
+        ;;
+      --gnss-connection=*)
+        CLI_PRESET=true
+        GNSS_CONNECTION_CLI_PRESET=true
+        case "${1#*=}" in
+          usb|USB)
+            GNSS_CONNECTION_HINT="usb"
+            ;;
+          uart|UART)
+            GNSS_CONNECTION_HINT="uart"
+            ;;
+          *)
+            error "Unknown GNSS connection: ${1#*=} (expected usb or uart)"
+            exit 1
+            ;;
+        esac
+        ;;
+      --gnss-device=*)
+        CLI_PRESET=true
+        GNSS_SERIAL_DEVICE_CLI_PRESET=true
+        GNSS_SERIAL_DEVICE="${1#*=}"
+        ;;
+      --gnss-baud=*)
+        CLI_PRESET=true
+        GNSS_SERIAL_BAUD_CLI_PRESET=true
+        local gnss_baud_spec="${1#*=}"
+        case "$gnss_baud_spec" in
+          auto)
+            GNSS_SERIAL_BAUD=""
+            ;;
+          ''|*[!0-9]*)
+            error "Unknown GNSS baud: $gnss_baud_spec (expected auto or a numeric baud rate)"
+            exit 1
+            ;;
+          *)
+            GNSS_SERIAL_BAUD="$gnss_baud_spec"
+            ;;
+        esac
+        ;;
+      --gnss-receiver-family=*)
+        CLI_PRESET=true
+        GNSS_RECEIVER_FAMILY_CLI_PRESET=true
+        local receiver_family_spec
+        receiver_family_spec="$(normalize_gnss_receiver_family "${1#*=}")"
+        case "$receiver_family_spec" in
+          auto|ublox|unicore|nmea)
+            GNSS_RECEIVER_FAMILY="$receiver_family_spec"
+            GNSS_BACKEND="universal"
+            ;;
+          *)
+            error "Unknown GNSS receiver family: ${1#*=} (expected auto|ublox|unicore|nmea)"
             exit 1
             ;;
         esac
@@ -388,22 +975,24 @@ parse_args() {
       --gps=*)
         CLI_PRESET=true
         local gps_spec="${1#*=}"
-        # Format: protocol-connection  e.g. ubx-usb, ubx-uart, nmea-usb, nmea-uart
+        # Deprecated legacy alias. Normalize it onto the Universal GNSS
+        # receiver-family + serial-connection contract.
         local gps_proto="${gps_spec%%-*}"
         local gps_conn="${gps_spec##*-}"
         case "$gps_proto" in
-          ubx)  GPS_PROTOCOL="UBX" ;;
-          nmea) GPS_PROTOCOL="NMEA" ;;
+          ubx)  GNSS_RECEIVER_FAMILY="${GNSS_RECEIVER_FAMILY:-auto}" ;;
+          nmea) GNSS_RECEIVER_FAMILY="nmea" ;;
           *)    error "Unknown GPS protocol: $gps_proto (expected ubx or nmea)"; exit 1 ;;
         esac
         case "$gps_conn" in
-          usb)  GPS_CONNECTION="usb";  GPS_UART_DEVICE="" ;;
-          uart) GPS_CONNECTION="uart" ;;
+          usb)  GNSS_CONNECTION_HINT="usb" ;;
+          uart) GNSS_CONNECTION_HINT="uart" ;;
           *)    error "Unknown GPS connection: $gps_conn (expected usb or uart)"; exit 1 ;;
         esac
+        GNSS_BACKEND="universal"
         ;;
       --gps-uart=*)
-        GPS_UART_DEVICE="${1#*=}"
+        GNSS_SERIAL_DEVICE="${1#*=}"
         ;;
       --lidar=*)
         CLI_PRESET=true
@@ -502,18 +1091,21 @@ load_existing_config() {
     return
   fi
 
-  _yaml_val() {
-    grep -E "^\s+${1}:" "$yaml_file" 2>/dev/null | head -1 | sed 's/.*:\s*//' | tr -d '"' | tr -d "'"
-  }
-
-  PREV_DATUM_LAT=$(_yaml_val datum_lat)
-  PREV_DATUM_LON=$(_yaml_val datum_lon)
-  PREV_NTRIP_ENABLED=$(_yaml_val ntrip_enabled)
-  PREV_NTRIP_HOST=$(_yaml_val ntrip_host)
-  PREV_NTRIP_PORT=$(_yaml_val ntrip_port)
-  PREV_NTRIP_USER=$(_yaml_val ntrip_user)
-  PREV_NTRIP_PASSWORD=$(_yaml_val ntrip_password)
-  PREV_NTRIP_MOUNTPOINT=$(_yaml_val ntrip_mountpoint)
+  PREV_DATUM_LAT="$(existing_yaml_value datum_lat "$yaml_file")"
+  PREV_DATUM_LON="$(existing_yaml_value datum_lon "$yaml_file")"
+  PREV_GNSS_RECEIVER_FAMILY="$(existing_yaml_value gnss_receiver_family "$yaml_file")"
+  PREV_GNSS_TRANSPORT="$(existing_yaml_value gnss_transport "$yaml_file")"
+  PREV_GNSS_SERIAL_DEVICE="$(existing_yaml_value gnss_serial_device "$yaml_file")"
+  PREV_GNSS_SERIAL_BAUD="$(existing_yaml_value gnss_serial_baud "$yaml_file")"
+  PREV_GNSS_FRAME_ID="$(existing_yaml_value gnss_frame_id "$yaml_file")"
+  PREV_GNSS_NTRIP_GGA_ENABLED="$(existing_yaml_value gnss_ntrip_gga_enabled "$yaml_file")"
+  PREV_GNSS_NTRIP_GGA_INTERVAL_S="$(existing_yaml_value gnss_ntrip_gga_interval_s "$yaml_file")"
+  PREV_NTRIP_ENABLED="$(existing_yaml_value ntrip_enabled "$yaml_file")"
+  PREV_NTRIP_HOST="$(existing_yaml_value ntrip_host "$yaml_file")"
+  PREV_NTRIP_PORT="$(existing_yaml_value ntrip_port "$yaml_file")"
+  PREV_NTRIP_USER="$(existing_yaml_value ntrip_user "$yaml_file")"
+  PREV_NTRIP_PASSWORD="$(existing_yaml_value ntrip_password "$yaml_file")"
+  PREV_NTRIP_MOUNTPOINT="$(existing_yaml_value ntrip_mountpoint "$yaml_file")"
 }
 
 interactive_config() {
@@ -627,7 +1219,7 @@ interactive_config() {
   echo ""
   echo -e "${CYAN}NTRIP RTK${NC} — correction stream for centimetre-level GPS accuracy"
   echo -e "${DIM}Free in France: crtk.net (user: centipede / pass: centipede)${NC}"
-  echo -e "${DIM}Default mountpoint NEAR picks the closest base via NMEA GGA (use NEAR4 on legacy receivers).${NC}"
+  echo -e "${DIM}Default mountpoint NEAR picks the closest base via NMEA GGA.${NC}"
   echo -e "${DIM}Find your nearest base station at https://centipede.fr${NC}"
 
   local prev_ntrip="${PREV_NTRIP_ENABLED:-false}"
@@ -672,6 +1264,12 @@ interactive_config() {
   CONFIG_NTRIP_USER="$ntrip_user"
   CONFIG_NTRIP_PASSWORD="$ntrip_password"
   CONFIG_NTRIP_MOUNTPOINT="$ntrip_mountpoint"
+  CONFIG_NTRIP_ENABLED_EXPLICIT=true
+  CONFIG_NTRIP_HOST_EXPLICIT=true
+  CONFIG_NTRIP_PORT_EXPLICIT=true
+  CONFIG_NTRIP_USER_EXPLICIT=true
+  CONFIG_NTRIP_PASSWORD_EXPLICIT=true
+  CONFIG_NTRIP_MOUNTPOINT_EXPLICIT=true
   CONFIG_LIDAR_X="0.20"
   CONFIG_LIDAR_Y="0.0"
   CONFIG_LIDAR_Z="0.22"
@@ -729,14 +1327,22 @@ PY
 write_config() {
   local yaml_file="$DOCKER_DIR/config/mowgli/mowgli_robot.yaml"
   local template="$INSTALL_DIR/config/mowgli/mowgli_robot.yaml"
+  local resolved_receiver_family resolved_transport resolved_serial_device
+  local resolved_serial_baud resolved_frame_id resolved_ntrip_enabled
+  local resolved_ntrip_host resolved_ntrip_port resolved_ntrip_user
+  local resolved_ntrip_password resolved_ntrip_mountpoint
+  local resolved_ntrip_gga_enabled resolved_ntrip_gga_interval_s
 
-  : "${GPS_PROTOCOL:=UBX}"
-  : "${GPS_PORT:=/dev/gps}"
-  : "${GPS_BAUD:=921600}"
+  : "${GNSS_RECEIVER_FAMILY:=auto}"
+  : "${GNSS_TRANSPORT:=serial}"
+  : "${GNSS_SERIAL_DEVICE:=/dev/ttyAMA4}"
+  : "${GNSS_SERIAL_BAUD:=921600}"
+  : "${GNSS_FRAME_ID:=gps_link}"
+  : "${GNSS_NTRIP_GGA_ENABLED:=true}"
+  : "${GNSS_NTRIP_GGA_INTERVAL_S:=10}"
 
-  # docker/.env is the installer/compose source of truth. This generated yaml
-  # is the ROS-side runtime config materialised from the current env values.
-  #
+  load_existing_config
+
   # Seed from the comprehensive template if the runtime yaml doesn't
   # exist yet. We never overwrite an existing file — that would wipe
   # GUI-managed values like chassis dims, IMU calibration, fusion
@@ -757,18 +1363,56 @@ EOF
     info "Patching existing $yaml_file in place"
   fi
 
+  resolved_receiver_family="$(preserved_gnss_value \
+    "$(if gnss_installer_key_is_explicit GNSS_RECEIVER_FAMILY; then printf 'true'; else printf 'false'; fi)" \
+    "${GNSS_RECEIVER_FAMILY}" "${PREV_GNSS_RECEIVER_FAMILY:-}" "auto")"
+  resolved_transport="$(preserved_gnss_value \
+    "$(if gnss_installer_key_is_explicit GNSS_TRANSPORT; then printf 'true'; else printf 'false'; fi)" \
+    "${GNSS_TRANSPORT}" "${PREV_GNSS_TRANSPORT:-}" "serial")"
+  resolved_serial_device="$(preserved_gnss_value \
+    "$(if gnss_installer_key_is_explicit GNSS_SERIAL_DEVICE; then printf 'true'; else printf 'false'; fi)" \
+    "${GNSS_SERIAL_DEVICE}" "${PREV_GNSS_SERIAL_DEVICE:-}" "/dev/ttyAMA4")"
+  resolved_serial_baud="$(preserved_gnss_value \
+    "$(if gnss_installer_key_is_explicit GNSS_SERIAL_BAUD; then printf 'true'; else printf 'false'; fi)" \
+    "${GNSS_SERIAL_BAUD}" "${PREV_GNSS_SERIAL_BAUD:-}" "921600")"
+  resolved_frame_id="$(preserved_gnss_value \
+    "$(if gnss_installer_key_is_explicit GNSS_FRAME_ID; then printf 'true'; else printf 'false'; fi)" \
+    "${GNSS_FRAME_ID}" "${PREV_GNSS_FRAME_ID:-}" "gps_link")"
+  resolved_ntrip_enabled="$(preserved_gnss_value \
+    "${CONFIG_NTRIP_ENABLED_EXPLICIT:-false}" "${CONFIG_NTRIP_ENABLED:-}" "${PREV_NTRIP_ENABLED:-}" "true")"
+  resolved_ntrip_host="$(preserved_gnss_value \
+    "${CONFIG_NTRIP_HOST_EXPLICIT:-false}" "${CONFIG_NTRIP_HOST:-}" "${PREV_NTRIP_HOST:-}" "crtk.net")"
+  resolved_ntrip_port="$(preserved_gnss_value \
+    "${CONFIG_NTRIP_PORT_EXPLICIT:-false}" "${CONFIG_NTRIP_PORT:-}" "${PREV_NTRIP_PORT:-}" "2101")"
+  resolved_ntrip_user="$(preserved_gnss_value \
+    "${CONFIG_NTRIP_USER_EXPLICIT:-false}" "${CONFIG_NTRIP_USER:-}" "${PREV_NTRIP_USER:-}" "centipede")"
+  resolved_ntrip_password="$(preserved_gnss_value \
+    "${CONFIG_NTRIP_PASSWORD_EXPLICIT:-false}" "${CONFIG_NTRIP_PASSWORD:-}" "${PREV_NTRIP_PASSWORD:-}" "centipede")"
+  resolved_ntrip_mountpoint="$(preserved_gnss_value \
+    "${CONFIG_NTRIP_MOUNTPOINT_EXPLICIT:-false}" "${CONFIG_NTRIP_MOUNTPOINT:-}" "${PREV_NTRIP_MOUNTPOINT:-}" "NEAR")"
+  resolved_ntrip_gga_enabled="$(preserved_gnss_value \
+    "$(if gnss_installer_key_is_explicit GNSS_NTRIP_GGA_ENABLED; then printf 'true'; else printf 'false'; fi)" \
+    "${GNSS_NTRIP_GGA_ENABLED}" "${PREV_GNSS_NTRIP_GGA_ENABLED:-}" "true")"
+  resolved_ntrip_gga_interval_s="$(preserved_gnss_value \
+    "$(if gnss_installer_key_is_explicit GNSS_NTRIP_GGA_INTERVAL_S; then printf 'true'; else printf 'false'; fi)" \
+    "${GNSS_NTRIP_GGA_INTERVAL_S}" "${PREV_GNSS_NTRIP_GGA_INTERVAL_S:-}" "10")"
+
   # Patch in only the keys the installer is responsible for.
   _yaml_patch_key "$yaml_file" datum_lat       "$CONFIG_DATUM_LAT"
   _yaml_patch_key "$yaml_file" datum_lon       "$CONFIG_DATUM_LON"
-  _yaml_patch_key "$yaml_file" gps_port        "\"$GPS_PORT\""
-  _yaml_patch_key "$yaml_file" gps_baudrate    "$GPS_BAUD"
-  _yaml_patch_key "$yaml_file" gps_protocol    "$GPS_PROTOCOL"
-  _yaml_patch_key "$yaml_file" ntrip_enabled   "$CONFIG_NTRIP_ENABLED"
-  _yaml_patch_key "$yaml_file" ntrip_host      "\"$CONFIG_NTRIP_HOST\""
-  _yaml_patch_key "$yaml_file" ntrip_port      "$CONFIG_NTRIP_PORT"
-  _yaml_patch_key "$yaml_file" ntrip_user      "\"$CONFIG_NTRIP_USER\""
-  _yaml_patch_key "$yaml_file" ntrip_password  "\"$CONFIG_NTRIP_PASSWORD\""
-  _yaml_patch_key "$yaml_file" ntrip_mountpoint "\"$CONFIG_NTRIP_MOUNTPOINT\""
+  _yaml_patch_key "$yaml_file" gnss_receiver_family "\"$resolved_receiver_family\""
+  _yaml_patch_key "$yaml_file" gnss_transport "\"$resolved_transport\""
+  _yaml_patch_key "$yaml_file" gnss_serial_device "\"$resolved_serial_device\""
+  _yaml_patch_key "$yaml_file" gnss_serial_baud "$resolved_serial_baud"
+  _yaml_patch_key "$yaml_file" gnss_frame_id "\"$resolved_frame_id\""
+  _yaml_patch_key "$yaml_file" ntrip_enabled   "$resolved_ntrip_enabled"
+  _yaml_patch_key "$yaml_file" ntrip_host      "\"$resolved_ntrip_host\""
+  _yaml_patch_key "$yaml_file" ntrip_port      "$resolved_ntrip_port"
+  _yaml_patch_key "$yaml_file" ntrip_user      "\"$resolved_ntrip_user\""
+  _yaml_patch_key "$yaml_file" ntrip_password  "\"$resolved_ntrip_password\""
+  _yaml_patch_key "$yaml_file" ntrip_mountpoint "\"$resolved_ntrip_mountpoint\""
+  _yaml_patch_key "$yaml_file" gnss_ntrip_gga_enabled "$resolved_ntrip_gga_enabled"
+  _yaml_patch_key "$yaml_file" gnss_ntrip_gga_interval_s "$resolved_ntrip_gga_interval_s"
 
   # LiDAR enable + the LiDAR-aware localizer flags. When the operator
   # picked a LiDAR in the previous step we also want the GTSAM
@@ -779,7 +1423,6 @@ EOF
     lidar_on="true"
   fi
   _yaml_patch_key "$yaml_file" lidar_enabled     "$lidar_on"
-  _yaml_patch_key "$yaml_file" use_fusion_graph  "$lidar_on"
   _yaml_patch_key "$yaml_file" use_scan_matching "$lidar_on"
   _yaml_patch_key "$yaml_file" use_loop_closure  "$lidar_on"
 
@@ -797,28 +1440,6 @@ EOF
   _yaml_patch_key "$yaml_file" dock_pose_yaw "$CONFIG_DOCK_YAW"
 
   info "Wrote $yaml_file"
-
-  cat > "$DOCKER_DIR/config/om/mower_config.sh" <<EOF
-export OM_DATUM_LAT=$CONFIG_DATUM_LAT
-export OM_DATUM_LONG=$CONFIG_DATUM_LON
-export OM_GPS_PROTOCOL=$GPS_PROTOCOL
-export OM_GPS_PORT=$GPS_PORT
-export OM_GPS_BAUDRATE=$GPS_BAUD
-export OM_USE_NTRIP=$( [[ "$CONFIG_NTRIP_ENABLED" == "true" ]] && echo "True" || echo "False" )
-export OM_NTRIP_HOSTNAME=$CONFIG_NTRIP_HOST
-export OM_NTRIP_PORT=$CONFIG_NTRIP_PORT
-export OM_NTRIP_USER=$CONFIG_NTRIP_USER
-export OM_NTRIP_PASSWORD=$CONFIG_NTRIP_PASSWORD
-export OM_NTRIP_ENDPOINT=$CONFIG_NTRIP_MOUNTPOINT
-export OM_TOOL_WIDTH=0.13
-export OM_ENABLE_MOWER=true
-export OM_AUTOMATIC_MODE=0
-export OM_BATTERY_FULL_VOLTAGE=28.5
-export OM_BATTERY_EMPTY_VOLTAGE=24.0
-export OM_BATTERY_CRITICAL_VOLTAGE=23.0
-EOF
-
-  info "Wrote mower_config.sh"
 }
 
 auto_detect_position() {
@@ -836,20 +1457,14 @@ auto_detect_position() {
   fi
 
   local gnss_backend
-  local gps_container
+  local gnss_stack
   local restart_services=()
 
   gnss_backend="$(effective_gnss_backend 2>/dev/null || true)"
-  gps_container="$(compose_gnss_container_name "$gnss_backend" 2>/dev/null || true)"
+  gnss_stack="$(effective_gnss_stack 2>/dev/null || true)"
 
   if ! docker_cmd inspect -f '{{.State.Status}}' mowgli-ros2 2>/dev/null | grep -q running; then
     warn "mowgli-ros2 container not running — cannot auto-detect"
-    add_issue "Set datum_lat and datum_lon manually in config/mowgli/mowgli_robot.yaml"
-    return
-  fi
-
-  if [ -z "$gps_container" ] || ! docker_cmd inspect -f '{{.State.Status}}' "$gps_container" 2>/dev/null | grep -q running; then
-    warn "GPS container not running — cannot auto-detect"
     add_issue "Set datum_lat and datum_lon manually in config/mowgli/mowgli_robot.yaml"
     return
   fi
@@ -860,8 +1475,8 @@ auto_detect_position() {
   local attempt=0
   while [[ $attempt -lt 12 ]]; do
     fix_data=$(docker_cmd exec mowgli-ros2 bash -c "source /opt/ros/kilted/setup.bash && source /ros2_ws/install/setup.bash && timeout 5 ros2 topic echo /gps/fix --once 2>/dev/null" 2>/dev/null || true)
-    lat=$(echo "$fix_data" | grep "latitude:" | awk '{print $2}')
-    lon=$(echo "$fix_data" | grep "longitude:" | awk '{print $2}')
+    lat=$(awk '/latitude:/ {print $2; exit}' <<< "$fix_data")
+    lon=$(awk '/longitude:/ {print $2; exit}' <<< "$fix_data")
 
     if [[ -n "$lat" && "$lat" != "0.0" ]]; then
       break
@@ -883,7 +1498,7 @@ auto_detect_position() {
   if docker_cmd inspect -f '{{.State.Status}}' mowgli-ros2 2>/dev/null | grep -q running; then
     local status_data
     status_data=$(docker_cmd exec mowgli-ros2 bash -c "source /opt/ros/kilted/setup.bash && source /ros2_ws/install/setup.bash && timeout 5 ros2 topic echo /hardware_bridge/status --once 2>/dev/null" 2>/dev/null || true)
-    is_charging=$(echo "$status_data" | grep "is_charging:" | awk '{print $2}')
+    is_charging=$(awk '/is_charging:/ {print $2; exit}' <<< "$status_data")
   fi
 
   CONFIG_DATUM_LAT="$lat"

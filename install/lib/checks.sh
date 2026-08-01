@@ -6,8 +6,6 @@ container_name_for_service() {
   case "$svc" in
     mowgli)       printf 'mowgli-ros2\n' ;;
     gps)          printf 'mowgli-gps\n' ;;
-    gnss_ublox)   printf 'mowgli-gps\n' ;;
-    gnss_unicore) printf 'mowgli-gps\n' ;;
     lidar)        printf 'mowgli-lidar\n' ;;
     gui)          printf 'mowgli-gui\n' ;;
     mosquitto)    printf 'mowgli-mqtt\n' ;;
@@ -34,9 +32,11 @@ expected_runtime_services() {
 
   local services=(mowgli gui mosquitto)
   local gnss_backend
+  local gnss_stack
   local gnss_service
 
   gnss_backend="$(effective_gnss_backend 2>/dev/null || true)"
+  gnss_stack="$(effective_gnss_stack 2>/dev/null || true)"
 
   if [[ "${HARDWARE_BACKEND:-mowgli}" == "mavros" ]]; then
     services+=(mavros ntrip)
@@ -45,8 +45,10 @@ expected_runtime_services() {
       return 1
     fi
 
-    gnss_service="$(compose_gnss_service_name "$gnss_backend" 2>/dev/null || true)"
-    [ -n "$gnss_service" ] && services+=("$gnss_service")
+    if [[ "$gnss_stack" != "disabled" ]]; then
+      gnss_service="$(compose_gnss_service_name "$gnss_backend" 2>/dev/null || true)"
+      [ -n "$gnss_service" ] && services+=("$gnss_service")
+    fi
   fi
 
   if [[ "${LIDAR_ENABLED}" == "true" && "${LIDAR_TYPE}" != "none" ]]; then
@@ -71,28 +73,24 @@ expected_runtime_services() {
 check_devices() {
   step "Check: Hardware devices"
 
-  : "${GPS_PORT:=/dev/gps}"
   : "${LIDAR_PORT:=/dev/lidar}"
   : "${LIDAR_TYPE:=unknown}"
   : "${LIDAR_ENABLED:=true}"
-  : "${UBLOX_DEVICE_SERIAL_STRING:=}"
 
   local devices=()
   local gnss_backend
+  local gnss_device
+  local gnss_connection
 
   gnss_backend="$(effective_gnss_backend 2>/dev/null || true)"
+  gnss_device="$(gnss_serial_device_from_state)"
+  gnss_connection="$(gnss_connection_from_serial_device "$gnss_device")"
 
   if [[ "${HARDWARE_BACKEND:-mowgli}" == "mavros" ]]; then
     devices+=("${MAVROS_PORT:-/dev/mavros}:Pixhawk MAVROS serial")
   else
     devices+=("/dev/mowgli:Mowgli STM32 board")
-    # Prefer the by-id symlink for USB receivers — it's what the container
-    # uses via GPS_DEVICE_PATH and is always created by systemd-udev.
-    local gps_device="${GPS_PORT}"
-    if [[ "${GPS_CONNECTION:-}" == "usb" ]] && [[ -n "${GPS_BY_ID:-}" ]]; then
-      gps_device="${GPS_BY_ID}"
-    fi
-    devices+=("${gps_device}:GPS receiver")
+    devices+=("${gnss_device}:GPS receiver")
   fi
 
   if [[ "${LIDAR_ENABLED}" == "true" && "${LIDAR_TYPE}" != "none" ]]; then
@@ -123,8 +121,10 @@ check_devices() {
         *)
           local uart_dev=""
           local sensor_name=""
-          if [[ "$dev" == "$GPS_PORT" ]]; then
-            uart_dev="${GPS_UART_DEVICE:-}"
+          if [[ "$dev" == "$gnss_device" ]]; then
+            if [[ "$gnss_connection" == "uart" ]]; then
+              uart_dev="$gnss_device"
+            fi
             sensor_name="GPS"
           elif [[ "$dev" == "$LIDAR_PORT" ]]; then
             uart_dev="${LIDAR_UART_DEVICE:-}"
@@ -146,26 +146,6 @@ check_devices() {
       esac
     fi
   done
-
-  if [[ "${HARDWARE_BACKEND:-mowgli}" != "mavros" && "${GPS_CONNECTION:-}" == "uart" && -L "${GPS_PORT}" && -n "${GPS_UART_DEVICE:-}" ]]; then
-    local gps_target
-    gps_target="$(readlink -f "$GPS_PORT")"
-    if [[ "$gps_target" != "$GPS_UART_DEVICE" ]]; then
-      warn "GPS symlink mismatch: $GPS_PORT -> $gps_target (expected $GPS_UART_DEVICE)"
-      add_issue "GPS symlink $GPS_PORT points to $gps_target instead of $GPS_UART_DEVICE. Re-run $(installer_main_command) or fix udev rules."
-    fi
-  fi
-
-  if [[ "${HARDWARE_BACKEND:-mowgli}" != "mavros" && "${GPS_CONNECTION:-}" == "usb" && -L "${GPS_PORT}" && -n "${GPS_BY_ID:-}" && -e "${GPS_BY_ID}" && "${GPS_PORT}" != "${GPS_BY_ID}" ]]; then
-    local gps_target
-    local gps_expected
-    gps_target="$(readlink -f "$GPS_PORT")"
-    gps_expected="$(readlink -f "$GPS_BY_ID")"
-    if [[ "$gps_target" != "$gps_expected" ]]; then
-      warn "GPS symlink mismatch: $GPS_PORT -> $gps_target (expected $gps_expected from $GPS_BY_ID)"
-      add_issue "GPS symlink $GPS_PORT points to $gps_target instead of the selected USB device $GPS_BY_ID. Re-run $(installer_main_command) or fix udev rules."
-    fi
-  fi
 
   if [[ "${LIDAR_CONNECTION:-}" == "uart" && -L "${LIDAR_PORT}" && -n "${LIDAR_UART_DEVICE:-}" ]]; then
     local lidar_target
@@ -196,36 +176,49 @@ check_generated_gps_yaml_alignment() {
   step "Check: Generated GPS YAML"
 
   local yaml_file="$DOCKER_DIR/config/mowgli/mowgli_robot.yaml"
-  local yaml_port yaml_baud yaml_protocol
+  local yaml_receiver_family yaml_serial_device yaml_serial_baud
+  local yaml_frame_id yaml_ntrip_enabled
+
+  _describe_gnss_resolution() {
+    local label="$1"
+    local yaml_value="$2"
+    local env_value="$3"
+    local default_value="$4"
+
+    if [[ -n "$yaml_value" ]]; then
+      if [[ -n "$env_value" && "$yaml_value" != "$env_value" ]]; then
+        info "$label resolves from mowgli_robot.yaml ($yaml_value); docker/.env fallback remains $env_value"
+      else
+        info "$label resolves from mowgli_robot.yaml ($yaml_value)"
+      fi
+      return 0
+    fi
+
+    if [[ -n "$env_value" ]]; then
+      info "$label falls back to docker/.env ($env_value)"
+      return 0
+    fi
+
+    info "$label falls back to the built-in default ($default_value)"
+  }
 
   if [[ ! -f "$yaml_file" ]]; then
     fail "Generated mowgli_robot.yaml missing"
-    add_issue "Missing $yaml_file. Re-run $(installer_main_command) to regenerate the ROS config from docker/.env."
+    add_issue "Missing $yaml_file. Re-run $(installer_main_command) to create the active GNSS YAML config."
     return
   fi
 
-  yaml_port="$(yaml_gps_value "$yaml_file" gps_port)"
-  yaml_baud="$(yaml_gps_value "$yaml_file" gps_baudrate)"
-  yaml_protocol="$(yaml_gps_value "$yaml_file" gps_protocol)"
+  yaml_receiver_family="$(yaml_gps_value "$yaml_file" gnss_receiver_family)"
+  yaml_serial_device="$(yaml_gps_value "$yaml_file" gnss_serial_device)"
+  yaml_serial_baud="$(yaml_gps_value "$yaml_file" gnss_serial_baud)"
+  yaml_frame_id="$(yaml_gps_value "$yaml_file" gnss_frame_id)"
+  yaml_ntrip_enabled="$(yaml_gps_value "$yaml_file" ntrip_enabled)"
 
-  if [[ "$yaml_port" != "${GPS_PORT:-/dev/gps}" ]]; then
-    fail "GPS port diverges between docker/.env and mowgli_robot.yaml"
-    add_issue "docker/.env has GPS_PORT=${GPS_PORT:-/dev/gps} but $yaml_file has gps_port=${yaml_port:-missing}. Re-run $(installer_main_command) to resync."
-  fi
-
-  if [[ "$yaml_baud" != "${GPS_BAUD:-921600}" ]]; then
-    fail "GPS baud diverges between docker/.env and mowgli_robot.yaml"
-    add_issue "docker/.env has GPS_BAUD=${GPS_BAUD:-921600} but $yaml_file has gps_baudrate=${yaml_baud:-missing}. Re-run $(installer_main_command) to resync."
-  fi
-
-  if [[ "$yaml_protocol" != "${GPS_PROTOCOL:-UBX}" ]]; then
-    fail "GPS protocol diverges between docker/.env and mowgli_robot.yaml"
-    add_issue "docker/.env has GPS_PROTOCOL=${GPS_PROTOCOL:-UBX} but $yaml_file has gps_protocol=${yaml_protocol:-missing}. Re-run $(installer_main_command) to resync."
-  fi
-
-  if [[ "$yaml_port" == "${GPS_PORT:-/dev/gps}" && "$yaml_baud" == "${GPS_BAUD:-921600}" && "$yaml_protocol" == "${GPS_PROTOCOL:-UBX}" ]]; then
-    info "docker/.env and mowgli_robot.yaml agree on gps_port/gps_baudrate/gps_protocol"
-  fi
+  _describe_gnss_resolution "GNSS receiver family" "$yaml_receiver_family" "${GNSS_RECEIVER_FAMILY:-}" "auto"
+  _describe_gnss_resolution "GNSS serial device" "$yaml_serial_device" "${GNSS_SERIAL_DEVICE:-}" "/dev/ttyAMA4"
+  _describe_gnss_resolution "GNSS serial baud" "$yaml_serial_baud" "${GNSS_SERIAL_BAUD:-}" "921600"
+  _describe_gnss_resolution "GNSS frame_id" "$yaml_frame_id" "${GNSS_FRAME_ID:-}" "gps_link"
+  _describe_gnss_resolution "GNSS NTRIP enabled" "$yaml_ntrip_enabled" "${GNSS_NTRIP_ENABLED:-}" "true"
 }
 
 check_containers() {
@@ -325,16 +318,13 @@ check_firmware() {
 check_gps() {
   step "Check: GPS"
 
-  : "${GNSS_BACKEND:=gps}"
+  : "${GNSS_BACKEND:=universal}"
   local gnss_backend
+  local gnss_stack
   local gps_container
-  local gps_protocol="${GPS_PROTOCOL:-UBX}"
 
   gnss_backend="$(effective_gnss_backend 2>/dev/null || true)"
-
-  if [[ "${GNSS_BACKEND:-}" == "nmea" ]]; then
-    gps_protocol="NMEA"
-  fi
+  gnss_stack="$(effective_gnss_stack 2>/dev/null || true)"
 
   if [[ "${HARDWARE_BACKEND:-mowgli}" == "mavros" ]]; then
     info "MAVROS backend: GPS is handled through Pixhawk/MAVROS"
@@ -415,6 +405,10 @@ check_gps() {
     return
   fi
 
+  if [[ "$gnss_stack" == "universal" ]]; then
+    info "Universal GNSS mode: expected direct sidecar ${gps_container}"
+  fi
+
   local fix_data
   fix_data="$(
     docker_cmd exec mowgli-ros2 bash -lc \
@@ -424,7 +418,11 @@ check_gps() {
 
   if [[ -z "$fix_data" ]]; then
     fail "No GPS fix data on /gps/fix"
-    add_issue "GPS not publishing. Check logs: $(print_logs_command_for_container "$gps_container" 30)"
+    if [[ "$gnss_stack" == "universal" ]]; then
+      add_issue "Universal GNSS sidecar is not publishing /gps/fix. Check logs: $(print_logs_command_for_container "$gps_container" 80)"
+    else
+      add_issue "GPS not publishing. Check logs: $(print_logs_command_for_container "$gps_container" 30)"
+    fi
     return
   fi
 
@@ -452,34 +450,20 @@ check_gps() {
     fail "GPS: No fix (status=$status_val)"
   fi
 
-  if [[ "$gnss_backend" != "gps" ]]; then
-    info "GNSS backend ${gnss_backend}: direct /gps/fix check passed"
-  fi
+  info "Universal GNSS sidecar: /gps/fix is reaching mowgli-ros2"
 
-  if [[ "$gnss_backend" == "gps" && "$gps_protocol" == "NMEA" ]]; then
-    info "GPS protocol NMEA on the generic gps backend: skipping bundled NTRIP check"
-  else
-    local ntrip_logs
-    ntrip_logs="$(docker_cmd logs "$gps_container" --tail 80 2>&1 || true)"
-
-    if echo "$ntrip_logs" | grep -q "Connected to http"; then
-      local ntrip_url
-      ntrip_url="$(echo "$ntrip_logs" | grep -oP "Connected to \K[^ ]+" | tail -1)"
-      info "NTRIP connected: $ntrip_url"
-    elif echo "$ntrip_logs" | grep -q "Unable to connect"; then
-      fail "NTRIP connection failed"
-      add_issue "NTRIP cannot connect. Check ntrip_host and ntrip_mountpoint in docker/config/mowgli/mowgli_robot.yaml"
-    elif echo "$ntrip_logs" | grep -q "Network is unreachable"; then
-      fail "NTRIP: network unreachable"
-      add_issue "No internet connection for NTRIP. Check your network configuration."
-    fi
-
-    if echo "$ntrip_logs" | grep -q "Forwarded.*RTCM messages"; then
-      local rtcm_count
-      rtcm_count="$(echo "$ntrip_logs" | grep -oP "Forwarded \K\d+" | tail -1)"
-      info "RTCM bridge: $rtcm_count corrections forwarded to GPS"
-    elif echo "$ntrip_logs" | grep -q "NTRIP enabled: true"; then
-      warn "RTCM bridge not forwarding yet — RTK may take a few minutes to converge"
+  if [[ "${GNSS_NTRIP_ENABLED:-false}" == "true" ]]; then
+    local rtcm_info
+    rtcm_info="$(
+      docker_cmd exec mowgli-ros2 bash -lc \
+        "source /opt/ros/kilted/setup.bash && source /ros2_ws/install/setup.bash && ros2 topic info /rtcm 2>/dev/null" \
+        2>/dev/null || echo ""
+    )"
+    if echo "$rtcm_info" | grep -q "Publisher count: [1-9]"; then
+      info "Universal GNSS NTRIP: RTCM topic has publisher(s)"
+    else
+      warn "Universal GNSS NTRIP enabled but no RTCM publisher detected on /rtcm"
+      add_issue "GNSS_NTRIP_ENABLED=true but /rtcm has no publishers. Check $(print_logs_command_for_container "$gps_container" 80) and the NTRIP settings in docker/config/mowgli/mowgli_robot.yaml."
     fi
   fi
 
@@ -549,8 +533,9 @@ check_lidar() {
 }
 
 # check_slam() — REMOVED. SLAM (slam_toolbox, Cartographer, etc.) has been
-# removed from the MowgliNext stack. The map frame is provided by
-# navsat_transform + RTK GPS via robot_localization's dual EKF.
+# removed from the MowgliNext stack. The map+odom frames are provided by the
+# fusion_graph GTSAM localizer (sole and default; it owns both map->odom and
+# odom->base_footprint). The old robot_localization dual EKF was also removed.
 # See CLAUDE.md "Architecture Invariants" for details.
 
 check_rangefinders() {
@@ -598,9 +583,9 @@ check_gui() {
 
   if curl -sf -o /dev/null --connect-timeout 3 "http://$ip:4006" 2>/dev/null || \
      curl -sf -o /dev/null --connect-timeout 3 "http://localhost:4006" 2>/dev/null; then
-    info "GUI accessible at http://$ip"
+    info "GUI accessible at http://$ip:4006"
   else
-    warn "GUI might be starting up — try http://$ip in your browser"
+    warn "GUI might be starting up — try http://$ip:4006 in your browser"
   fi
 
   local fg_info
@@ -618,7 +603,7 @@ check_gui() {
 
   echo ""
   echo -e "  ${BOLD}Access points:${NC}"
-  echo -e "    GUI:       ${CYAN}http://$ip${NC}"
+  echo -e "    GUI:       ${CYAN}http://$ip:4006${NC}"
   echo -e "    Foxglove:  ${CYAN}ws://$ip:8765${NC}"
   echo -e "    Rosbridge: ${CYAN}ws://$ip:9090${NC}"
   echo -e "    MQTT:      ${CYAN}$ip:1883${NC}"

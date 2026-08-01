@@ -24,7 +24,12 @@ type DrawControlProps = ConstructorParameters<typeof MapboxDraw>[0] & {
 export default function DrawControl(props: DrawControlProps) {
     const {
         drawRef, features, editMode, position,
-        onCreate, onUpdate, onCombine, onDelete, onSelectionChange, onOpenDetails,
+        onCreate = () => {},
+        onUpdate = () => {},
+        onCombine = () => {},
+        onDelete = () => {},
+        onSelectionChange = () => {},
+        onOpenDetails = () => {},
         ...drawOptions
     } = props;
     const rawMapRef = useRef<ReturnType<MapRef['getMap']> | null>(null);
@@ -47,6 +52,10 @@ export default function DrawControl(props: DrawControlProps) {
     const onOpenDetailsRef = useRef(onOpenDetails);
     onOpenDetailsRef.current = onOpenDetails;
 
+    // Keep stable references to the bound listeners so cleanup can map.off()
+    // exactly what was map.on()'d. Without this, StrictMode's mount/unmount/
+    // remount cycle stacks duplicate listeners → each draw.* event fires twice.
+    const drawHandlersRef = useRef<Record<string, (e: any) => void>>({});
     const mp = useControl<MapboxDraw>(
         () => new MapboxDraw({
             ...drawOptions,
@@ -58,16 +67,25 @@ export default function DrawControl(props: DrawControlProps) {
         }),
         ({map}: {map: MapRef}) => {
             rawMapRef.current = map.getMap();
-            map.on('draw.create', (e: any) => onCreateRef.current(e));
-            map.on('draw.update', (e: any) => onUpdateRef.current(e));
-            map.on('draw.combine', (e: any) => onCombineRef.current(e));
-            map.on('draw.delete', (e: any) => onDeleteRef.current(e));
-            map.on('draw.selectionchange', (e: any) => onSelectionChangeRef.current(e));
-            map.on('feature.open', (e: any) => onOpenDetailsRef.current(e));
+            const handlers: Record<string, (e: any) => void> = {
+                'draw.create': (e: any) => onCreateRef.current(e),
+                'draw.update': (e: any) => onUpdateRef.current(e),
+                'draw.combine': (e: any) => onCombineRef.current(e),
+                'draw.delete': (e: any) => onDeleteRef.current(e),
+                'draw.selectionchange': (e: any) => onSelectionChangeRef.current(e),
+                'feature.open': (e: any) => onOpenDetailsRef.current(e),
+            };
+            drawHandlersRef.current = handlers;
+            for (const [event, handler] of Object.entries(handlers)) {
+                map.on(event as any, handler);
+            }
         },
-        ({map: _map}: {map: MapRef}) => {
+        ({map}: {map: MapRef}) => {
+            for (const [event, handler] of Object.entries(drawHandlersRef.current)) {
+                map.off(event as any, handler);
+            }
+            drawHandlersRef.current = {};
             rawMapRef.current = null;
-            void _map; // cleanup only runs on unmount
         }
         ,
         {
@@ -84,19 +102,36 @@ export default function DrawControl(props: DrawControlProps) {
     // which causes useControl to remove and re-add the control (wiping its internal store).
     // By deferring, we ensure we write to the final, mounted instance.
     const syncTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
-    const prevFeaturesKeyRef = useRef<string>('');
+    // The SET key (ids + types only, NOT geometry) — a change here means
+    // features were added/removed and the store must be rebuilt (deleteAll +
+    // re-add). Geometry-only edits (a vertex drag) leave the set key unchanged
+    // and are upserted per-feature via mp.add() WITHOUT clearing the store, so
+    // the active direct_select session (and the user's selection) survives.
+    const prevSetKeyRef = useRef<string>('');
     useEffect(() => {
         if (!mp || !features) return;
         clearTimeout(syncTimerRef.current);
+        // Use 300ms instead of 0ms: on mobile the Mapbox GL map may still be
+        // initialising tiles/layers when React StrictMode or a mapKey remount
+        // fires this effect, and a 0ms flush races against the GL context setup.
+        // 300ms outlasts the GL bootstrap without noticeably delaying first paint.
         syncTimerRef.current = setTimeout(() => {
-            const key = JSON.stringify(features.map(f => [f.id, f.geometry]));
-            if (key === prevFeaturesKeyRef.current && mp.getAll().features.length > 0) return;
-            prevFeaturesKeyRef.current = key;
-            mp.deleteAll();
-            features.forEach((f) => {
-                mp.add(f);
-            });
-        }, 0);
+            const setKey = JSON.stringify(features.map(f => [f.id, f.geometry?.type]));
+            const storeEmpty = mp.getAll().features.length === 0;
+            if (setKey !== prevSetKeyRef.current || storeEmpty) {
+                // Feature set changed (or the store was wiped by a remount):
+                // rebuild it wholesale. This DOES clear selection, but a
+                // set-level change is a create/delete, not an in-place edit.
+                prevSetKeyRef.current = setKey;
+                mp.deleteAll();
+                features.forEach((f) => mp.add(f));
+            } else {
+                // Geometry-only change: upsert each feature in place. mp.add()
+                // replaces a feature with the same id without touching the
+                // selection, so a mid-drag direct_select session is preserved.
+                features.forEach((f) => mp.add(f));
+            }
+        }, 300);
         return () => clearTimeout(syncTimerRef.current);
     }, [mp, features]);
     useEffect(() => {
@@ -130,12 +165,3 @@ export default function DrawControl(props: DrawControlProps) {
     }, [mp]);
     return null;
 }
-
-DrawControl.defaultProps = {
-    onCreate: () => {},
-    onUpdate: () => {},
-    onDelete: () => {},
-    onCombine: () => {},
-    onSelectionChange: () => {},
-    onOpenDetails: () => {},
-};

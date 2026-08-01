@@ -1,6 +1,7 @@
 import { useApi } from "./useApi.ts";
 import { App } from "antd";
 import { useCallback, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 export type JSONSchema = {
     type?: string;
@@ -44,6 +45,7 @@ export type JSONSchemaCondition = {
 export const useSettingsSchema = () => {
     const guiApi = useApi();
     const { notification } = App.useApp();
+    const { t } = useTranslation();
     const [schema, setSchema] = useState<JSONSchema | null>(null);
     const [values, setValues] = useState<Record<string, any>>({});
     const [loading, setLoading] = useState(false);
@@ -66,7 +68,7 @@ export const useSettingsSchema = () => {
                 }
             } catch (e: any) {
                 notification.error({
-                    message: "Failed to load settings schema",
+                    message: t("settingsSchema.loadFailed"),
                     description: e.message,
                 });
             } finally {
@@ -86,20 +88,68 @@ export const useSettingsSchema = () => {
                 setValues(newValues);
                 setRestartRequired(true);
                 notification.success({
-                    message: "Settings saved",
-                    description: "Restart ROS2 to apply the new configuration.",
+                    message: t("settingsSections.toasts.saved"),
+                    description: t("settingsSections.toasts.savedDescription"),
                 });
             } catch (e: any) {
                 notification.error({
-                    message: "Failed to save settings",
+                    message: t("settingsSections.toasts.saveFailed"),
                     description: e.message,
                 });
             } finally {
                 setLoading(false);
             }
         },
-        [guiApi, notification]
+        [guiApi, notification, t]
     );
 
-    return { schema, values, saveValues, loading, restartRequired };
+    const savePartialValues = useCallback(
+        async (
+            partialValues: Record<string, any>,
+            options?: {
+                successMessage?: string;
+                successDescription?: string;
+                errorMessage?: string;
+                silentSuccess?: boolean;
+            },
+        ) => {
+            try {
+                const changedPayload: Record<string, any> = {};
+                for (const [key, value] of Object.entries(partialValues)) {
+                    if (JSON.stringify(value) !== JSON.stringify(values[key])) {
+                        changedPayload[key] = value;
+                    }
+                }
+
+                if (Object.keys(changedPayload).length === 0) {
+                    return true;
+                }
+
+                setLoading(true);
+                const res = await guiApi.settings.yamlCreate(changedPayload);
+                if (res.error) {
+                    throw new Error((res.error as any).error);
+                }
+                setValues((prev) => ({ ...prev, ...changedPayload }));
+                if (!options?.silentSuccess) {
+                    notification.success({
+                        message: options?.successMessage ?? t("settingsSections.toasts.saved"),
+                        description: options?.successDescription,
+                    });
+                }
+                return true;
+            } catch (e: any) {
+                notification.error({
+                    message: options?.errorMessage ?? t("settingsSections.toasts.saveFailed"),
+                    description: e.message,
+                });
+                return false;
+            } finally {
+                setLoading(false);
+            }
+        },
+        [guiApi, notification, values, t],
+    );
+
+    return { schema, values, saveValues, savePartialValues, loading, restartRequired };
 };

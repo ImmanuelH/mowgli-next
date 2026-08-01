@@ -3,31 +3,33 @@
 # start_dev_sim.sh
 #
 # Dev simulation entrypoint: builds the workspace from mounted sources if
-# needed, then starts VNC + Gazebo GUI + full Nav2 stack.
+# needed, then starts VNC + Webots GUI + full Nav2 stack.
 #
 # Usage (via docker compose):
 #   docker compose up dev-sim
 # =============================================================================
-set -e
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 VNC_PORT="${VNC_PORT:-5901}"
 NOVNC_PORT="${NOVNC_PORT:-6080}"
 VNC_RESOLUTION="${VNC_RESOLUTION:-1280x720}"
 
+set +u
 source /opt/ros/kilted/setup.bash
+set -u
 
 # ---- Build workspace if install tree is empty or stale ----------------------
 if [ ! -f /ros2_ws/install/setup.bash ]; then
     echo "=== First run: building full workspace from mounted sources ==="
-    cd /ros2_ws
-    colcon build \
-        --cmake-args -DCMAKE_BUILD_TYPE=Release \
-        --parallel-workers "$(nproc)" \
-        --event-handlers console_cohesion+
+    BUILD_TYPE=Release "${SCRIPT_DIR}/build.sh"
     echo "=== Build complete ==="
 fi
 
+set +u
 source /ros2_ws/install/setup.bash
+set -u
 
 # ---- Start VNC server -------------------------------------------------------
 echo "=== Starting VNC server on :1 (${VNC_RESOLUTION}) ==="
@@ -55,7 +57,7 @@ echo ""
 echo "========================================================"
 echo "  DEV SIMULATION"
 echo ""
-echo "  Gazebo GUI:      http://localhost:${NOVNC_PORT}/vnc.html"
+echo "  Webots GUI:      http://localhost:${NOVNC_PORT}/vnc.html"
 echo "  Foxglove Studio: ws://localhost:8765"
 echo ""
 echo "  Rebuild:  make dev-build"
@@ -66,7 +68,7 @@ echo "========================================================"
 echo ""
 
 # Launch file is configurable via LAUNCH_FILE env var.
-# Default: sim_full_system.launch.py with Gazebo GUI.
+# Default: sim_full_system.launch.py with Webots GUI.
 LAUNCH_FILE="${LAUNCH_FILE:-sim_full_system.launch.py}"
 LAUNCH_ARGS="${LAUNCH_ARGS:-headless:=false use_rviz:=false}"
 

@@ -8,8 +8,8 @@
 package main
 
 import (
-	"github.com/cedbossneo/mowglinext/pkg/api"
-	"github.com/cedbossneo/mowglinext/pkg/providers"
+	"github.com/mowglinext/mowglinext/pkg/api"
+	"github.com/mowglinext/mowglinext/pkg/providers"
 	"github.com/joho/godotenv"
 )
 
@@ -19,7 +19,7 @@ func main() {
 	dbProvider := providers.NewDBProvider()
 	dockerProvider := providers.NewDockerProvider()
 	rosProvider := providers.NewRosProvider(dbProvider)
-	firmwareProvider := providers.NewFirmwareProvider(dbProvider)
+	firmwareProvider := providers.NewFirmwareProvider(dbProvider, rosProvider)
 	homekitEnabled, err := dbProvider.Get("system.homekit.enabled")
 	if err != nil {
 		panic(err)

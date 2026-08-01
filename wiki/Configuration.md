@@ -4,7 +4,7 @@ Complete guide to all configuration files and parameters in the Mowgli ROS2 syst
 
 This documentation is for ROS2 Kilted with Gazebo Harmonic.
 
-[CLAUDE.md](https://github.com/cedbossneo/mowglinext/blob/main/CLAUDE.md) is the authoritative short-form reference. If any section here contradicts it, CLAUDE.md wins.
+[CLAUDE.md](https://github.com/mowglinext/mowglinext/blob/main/CLAUDE.md) is the authoritative short-form reference. If any section here contradicts it, CLAUDE.md wins.
 
 ## Overview
 
@@ -19,15 +19,42 @@ config/
 ├── nav2_params_no_lidar.yaml      # Navigation stack for GPS-only operation
 ├── twist_mux.yaml                 # Velocity multiplexer priorities
 ├── foxglove_bridge.yaml           # Foxglove Studio visualization bridge
-└── mowgli_robot.yaml              # Centralized robot config (bind-mounted from
-                                   #   install/config/mowgli at /ros2_ws/config/)
+└── mowgli_robot.yaml              # In-package TEMPLATE: the default value of
+                                   #   every robot parameter (see "Sparse robot
+                                   #   config model" below)
 ```
+
+The **installed** robot config lives outside the package at `/ros2_ws/config/mowgli_robot.yaml` (bind-mounted from `install/config/mowgli/`). See the next section — it is **sparse**, and the in-package `config/mowgli_robot.yaml` above is its **template of defaults**.
 
 There is **no** `slam_toolbox.yaml` or `kiss_icp.yaml`. robot_localization (the default dual-EKF localizer) is tuned through `robot_localization.yaml`. LiDAR scan-matching and loop-closure are handled by `fusion_graph` (opt-in — see [§5](#5-fusion_graph)).
 
 Whether the LiDAR-aware stack (`nav2_params.yaml`) or the GPS-only stack (`nav2_params_no_lidar.yaml`) is loaded is decided by the **`lidar_enabled`** key in `mowgli_robot.yaml`, which is **authoritative**. The `LIDAR_ENABLED` environment variable (set by the installer `.env`) is only a **fallback** — it applies solely when `lidar_enabled` is absent from the yaml, so a stale installer `.env` can never override the user's GUI-managed config. A CLI/compose `use_lidar:=` override still wins for one-off runs.
 
 The opt-in **fusion_graph** localizer (GTSAM iSAM2 — see [§7](#7-fusion_graph)) does **not** have a separate config file: its knobs are declared as ros2 parameters on `fusion_graph_node` and the high-level switches (`use_fusion_graph`, `use_scan_matching`, `use_loop_closure`, `use_magnetometer`) live in `mowgli_robot.yaml`. The Settings page exposes them under the *Localization* section.
+
+### Sparse robot config model
+
+`mowgli_robot.yaml` exists in **two** places, and they play different roles:
+
+| File | Role |
+|------|------|
+| `ros2/src/mowgli_bringup/config/mowgli_robot.yaml` | **Template** — ships with the software, versioned, holds the **default value of every robot parameter**. |
+| `/ros2_ws/config/mowgli_robot.yaml` (bind-mounted from `install/config/mowgli/`) | **Installed config** — **sparse**, holds only per-robot values (see below). |
+
+The installed file is **deliberately sparse**. It contains only:
+
+- **Install-time choices** — `datum_lat`/`datum_lon`, NTRIP credentials, `lidar_enabled`, GNSS hardware (`gnss_receiver_family`, `gnss_serial_device`, `gnss_serial_baud`), `mower_model`.
+- **Calibration outputs** — `dock_pose_x/y/yaw`, `ticks_per_meter`, the `wheel_pid_*` gains, `imu_yaw`, and the magnetometer settings (`enable_mag_cal`, `declination_deg`).
+
+**Every other parameter's default lives in the in-package template.** At launch, `ros2/src/mowgli_bringup/launch/robot_config_util.py` (`load_robot_params`) **deep-merges the sparse installed config *over* the template**, so any key absent from the installed file falls through to its template default. Nodes always receive a complete parameter set — only the on-disk installed file is allowed to be sparse.
+
+Consequences:
+
+- **Template edits propagate.** A maintainer bumping a default in the in-package template changes that value on **every robot** whose installed config does not explicitly override it. Reserve the sparse installed file for genuine per-robot overrides.
+- **Reset to default from the GUI.** The Settings page shows a small **dot** next to any value that differs from its default and a **reset (undo) button** to revert it. Reset works by **deleting the key** from the installed file so it falls back to the template — the GUI backend also **prunes any key whose saved value equals its default on write**, keeping the installed config sparse automatically.
+- **Older full configs still work.** A pre-split *full* installed `mowgli_robot.yaml` merges to itself (every key overrides its identical template default — a no-op merge), so upgrading needs no migration.
+
+> **To change a value:** set it in the installed config (it overrides the template). **To restore a default:** delete its line from the installed config (do NOT copy the template value back in) — or use the GUI reset button.
 
 All YAML files use the ROS2 `ros__parameters` namespace convention. Parameters can be overridden via command-line:
 
@@ -214,21 +241,25 @@ hardware_bridge:
 - **Purpose:** Firmware uses this for telemetry, sound notifications, LED feedback
 - **Tuning:** Lower rate OK (2 Hz sufficient for informational updates)
 
-#### `angular_rate_loop_enabled` / `angular_rate_kp` / `angular_rate_ki`
+#### Yaw-rate loop — now firmware-side (Option C, 2026-07-17)
 
-- **Type:** bool / double / double
-- **Defaults:** `true` / `0.4` / `2.0` (node defaults; **sourced from
-  `mowgli_robot.yaml`** and injected at launch by `mowgli.launch.py`, so they
-  are operator-tunable from the GUI config without editing `hardware_bridge.yaml`)
-- **Description:** Host-side gyro angular-rate PI on `wz`. When enabled,
-  `hardware_bridge` closes a yaw-rate loop on the IMU gyro before forwarding the
-  twist to firmware. When disabled (`angular_rate_loop_enabled: false`), `wz`
-  passes through untouched and the firmware per-wheel velocity PID owns all wheel
-  control.
-- **Note:** The host loop can ring in yaw (rotation overshoot). On this robot it
-  is disabled (`angular_rate_loop_enabled: false`) — the firmware velocity loop
-  handles wheel tracking. The default keeps the prior (enabled) behaviour so sim
-  and other configs are unchanged.
+- **History:** `hardware_bridge` used to run a host-side closed-loop gyro
+  angular-rate PI (`angular_rate_loop_enabled` / `angular_rate_kp` /
+  `angular_rate_ki` / `angular_rate_kff`, `angular_rate_controller.hpp`) that
+  closed a yaw-rate loop on the IMU gyro before forwarding `wz` to firmware.
+  It went through an "Option B" refit (task #24, ki→0/kff refit) to fix a
+  left-right weave caused by a 3-loop integrating cascade (FTC heading →
+  host PI → per-wheel firmware PIs) fighting itself over the ~50-90 ms USB
+  round trip.
+- **REMOVED (Option C, task #33/#34):** the whole host-side loop —
+  `angular_rate_controller.hpp`, the four `angular_rate_*` params, and their
+  GUI catalog entries — is gone. `hardware_bridge` now sends the commanded
+  `wz` straight through with no shaping. The yaw-rate loop moved INTO
+  FIRMWARE (task #33), which closes it on the same gyro without the host's
+  USB round-trip latency — collapsing the 3-loop cascade to 2 without the
+  Option B feed-forward-refit tradeoffs. Tunable via the firmware's
+  `yaw_kp`/`yaw_ki` (sent over `SET_DRIVE_PID`); GUI catalog entries for
+  those will land once the firmware param interface is finalized.
 
 ### Typical Configurations
 

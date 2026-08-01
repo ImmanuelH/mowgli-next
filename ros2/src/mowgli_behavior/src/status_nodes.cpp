@@ -15,6 +15,8 @@
 
 #include "mowgli_behavior/status_nodes.hpp"
 
+#include "mowgli_behavior/coverage_persistence.hpp"
+
 namespace mowgli_behavior
 {
 
@@ -44,29 +46,81 @@ BT::NodeStatus PublishHighLevelStatus::tick()
     return BT::NodeStatus::FAILURE;
   }
 
-  if (!pub_)
+  // Shared publisher owned by the context so the behavior_tree_node's periodic
+  // timer can re-publish the last status while a long-running FollowStrip keeps
+  // this SyncActionNode from ticking (see BTContext::last_high_level_status).
   {
-    pub_ =
-        ctx->node->create_publisher<mowgli_interfaces::msg::HighLevelStatus>("~/high_level_status",
-                                                                             10);
+    std::lock_guard<std::mutex> lock(ctx->context_mutex);
+    if (!ctx->high_level_status_pub)
+    {
+      ctx->high_level_status_pub =
+          ctx->node->create_publisher<mowgli_interfaces::msg::HighLevelStatus>(
+              "~/high_level_status", 10);
+    }
+  }
+
+  // Debounce transient IDLE. The requested state is recomputed from tree
+  // traversal each tick; a single-tick reactive deselection of MowingSequence
+  // (or a momentarily cleared current_command) makes the IdleSequence
+  // fall-through request IDLE for one tick mid-mission. Only publish IDLE after
+  // it has persisted for kIdleDebounceTicks ticks when coming FROM an active
+  // state (AUTONOMOUS/RECORDING/MANUAL_MOWING). All other transitions —
+  // including into motion states and into EMERGENCY/NULL — publish immediately.
+  const uint8_t requested_state = state_res.value();
+  uint8_t published_state = requested_state;
+  const bool was_active =
+      have_published_ && last_published_state_ != kStateIdle && last_published_state_ != kStateNull;
+  if (requested_state == kStateIdle && was_active)
+  {
+    if (++pending_idle_ticks_ < kIdleDebounceTicks)
+    {
+      // Hold the previous active state until IDLE proves persistent.
+      published_state = last_published_state_;
+    }
+    // else: IDLE has persisted long enough — accept it (published_state stays IDLE).
+  }
+  else
+  {
+    // Not a debounced IDLE transition — reset the counter and publish as-is.
+    pending_idle_ticks_ = 0;
   }
 
   mowgli_interfaces::msg::HighLevelStatus msg;
-  msg.state = state_res.value();
+  msg.state = published_state;
   msg.state_name = name_res.value();
+  last_published_state_ = published_state;
+  have_published_ = true;
   msg.sub_state_name = "";
   msg.current_area = static_cast<int16_t>(ctx->current_area);
-  msg.current_path = -1;
-  msg.current_path_index = static_cast<int16_t>(ctx->coverage_percent);
+  // Real per-area swath progress. The GUI computes progress as
+  // current_path_index / current_path * 100 (MowerStatus.tsx,
+  // MowgliNextPage.tsx), so current_path is the DENOMINATOR (total swaths in
+  // the current area's plan) and current_path_index the NUMERATOR (completed
+  // swaths). Both are tracked by PlanCoverageArea/FollowStrip in coverage_nodes
+  // (ctx->total_swaths / ctx->completed_swaths). Previously current_path was
+  // hardcoded to -1, which made the GUI ratio divide by a negative and never
+  // render a real percentage.
+  msg.current_path = static_cast<int16_t>(ctx->total_swaths);
+  msg.current_path_index = static_cast<int16_t>(ctx->completed_swaths);
   msg.total_swaths = static_cast<int16_t>(ctx->total_swaths);
   msg.completed_swaths = static_cast<int16_t>(ctx->completed_swaths);
   msg.skipped_swaths = static_cast<int16_t>(ctx->skipped_swaths);
+  // Smooth pose-cursor-based progress for the current area (primary GUI %); the
+  // swath counts above are the coarse secondary "sub-path X/Y" readout.
+  msg.coverage_percent = ctx->coverage_percent;
   msg.gps_quality_percent = ctx->gps_quality;
   msg.battery_percent = ctx->battery_percent;
   msg.is_charging = ctx->latest_power.charger_enabled;
   msg.emergency = ctx->latest_emergency.active_emergency;
 
-  pub_->publish(msg);
+  // Cache the message so the behavior_tree_node timer can re-publish it while
+  // the tree is parked in a long-running action with no further transitions.
+  {
+    std::lock_guard<std::mutex> lock(ctx->context_mutex);
+    ctx->last_high_level_status = msg;
+    ctx->has_high_level_status = true;
+    ctx->high_level_status_pub->publish(msg);
+  }
 
   RCLCPP_DEBUG(ctx->node->get_logger(),
                "PublishHighLevelStatus: state=%u name='%s'",
@@ -137,6 +191,29 @@ BT::NodeStatus EndSession::tick()
   // so the next COMMAND_START can plan + mow each area afresh.
   ctx->attempted_areas.clear();
   ctx->area_attempt_count.clear();
+  // Also clear the per-area coverage high-water mark (documented in
+  // bt_context.hpp as "Cleared by EndSession"). Leaking it across sessions
+  // makes the next session's first GetNextUnmowedArea dispatch compute
+  // made_progress against last session's mark, so a freshly resumable area
+  // (coverage reset / re-mow) is wrongly judged "no progress" and pushed
+  // toward premature give-up at kMaxAreaAttempts.
+  ctx->area_last_coverage.clear();
+  // Swath-completion model (replaces the cell coverage grid): clear the
+  // per-area completed-swath sets, swath counts, and the completed-area set so
+  // the next COMMAND_START re-plans and re-mows every area from swath 0.
+  // Leaking these across sessions would make the next session skip every
+  // already-mowed swath (the grid used to "decay"; the swath model resets at
+  // the session boundary instead).
+  ctx->area_completed_swaths.clear();
+  ctx->area_swath_count.clear();
+  ctx->area_resume_pose_index.clear();
+  ctx->area_path_pose_count.clear();
+  ctx->area_plan_fingerprint.clear();
+  ctx->completed_areas.clear();
+  // Remove the on-disk resume snapshot too: this is a real session boundary, so
+  // the next COMMAND_START must start fresh rather than resume a finished (or
+  // aborted-and-docked) session from the persisted cursor.
+  clearCoverageResumeState(*ctx);
   return BT::NodeStatus::SUCCESS;
 }
 
